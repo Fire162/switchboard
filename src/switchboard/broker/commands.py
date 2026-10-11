@@ -16,10 +16,10 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
-from switchboard import reviews
+from switchboard import invites, reviews
 from switchboard.broker import catchup
 from switchboard.delivery.rules import parse_mentions
-from switchboard.models import MAX_BUDGET, MAX_HOPS, SCREEN_NAME_RE, Room
+from switchboard.models import MAX_BUDGET, MAX_HOPS, SCREEN_NAME_RE, InvalidName, Room, normalize_room
 from switchboard.reviews import ReviewError
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -48,6 +48,10 @@ commands (type them in the web UI; the CLI runs them with `switchboard cmd '#roo
     /catchup codex-1 on "sprint cleanup"        on a topic, across the room
     /catchup codex-1                            on the room since it joined
     /catchup codex-1 on claude-1 pick it apart  plus a critical second opinion
+  /invite <agent> [from #room] [note]
+                      ask an agent from another of your rooms to join this one:
+                      one message to it, there; it joins itself (web only)
+  /uninvite <agent>   cancel that invitation before it joins
   /review <url> [note]
                       open this room's review board for a pull request or merge
                       request, and ask its agents to review it on the board
@@ -57,9 +61,9 @@ commands (type them in the web UI; the CLI runs them with `switchboard cmd '#roo
   //text              post text that starts with a single /"""
 
 _NO_ARGS = frozenset({"pause", "resume", "who", "status", "help", "close"})
-_ONE_NAME = frozenset({"kick", "hold", "release"})
+_ONE_NAME = frozenset({"kick", "hold", "release", "uninvite"})
 _ONE_NUMBER = {"budget": MAX_BUDGET, "hops": MAX_HOPS}  # /name [n], 0 <= n <= max
-KNOWN = _NO_ARGS | _ONE_NAME | set(_ONE_NUMBER) | {"catchup", "review"}
+KNOWN = _NO_ARGS | _ONE_NAME | set(_ONE_NUMBER) | {"catchup", "review", "invite"}
 
 _STATIC_ROLES = {
     "pause": "human_cli",
@@ -73,7 +77,12 @@ _STATIC_ROLES = {
     "help": "human_cli",
     "catchup": "human_cli",  # posts a human chat message, like `switchboard say`
     "review": "human_cli",  # the same: one chat message, and a board (§37.8)
+    # it wakes an agent in another room to bring it here: a person's, in the web (§43)
+    "invite": "human",
+    "uninvite": "human_cli",  # it only takes back an invitation
 }
+
+INVITE_USAGE = "/invite <agent> [from #room] [note]"
 
 REVIEW_USAGE = "/review <url> [note]"
 
@@ -140,6 +149,8 @@ def parse_command(text: str) -> Command:
         return _parse_catchup(raw[1:].split(None, 1)[1] if args else "", raw)
     if name == "review":
         return _parse_review(raw)
+    if name == "invite":
+        return _parse_invite(raw)
     if name in _NO_ARGS and args:
         raise CommandError("bad_request", f"/{name} takes no arguments")
     if name in _ONE_NAME:
@@ -245,6 +256,111 @@ def _parse_review(raw: str) -> Command:
         raise CommandError("bad_request", f"/review: {e}") from None
     note = catchup.clean_text(words[2]) if len(words) > 2 else ""
     return Command(name="review", args=(url, note), raw=raw)
+
+
+def _parse_invite(raw: str) -> Command:
+    """``/invite <agent> [from #room] [note...]`` (§43): ``args`` ``(agent, room or "", note)``.
+    ``from`` names the room the agent is in, when the name alone is more than one agent."""
+    words = raw[1:].split(None, 2)
+    if len(words) < 2:
+        raise CommandError("bad_request", f"usage: {INVITE_USAGE}")
+    agent = _screen_name("invite", words[1])
+    rest = words[2].strip() if len(words) > 2 else ""
+    source = ""
+    if rest[:4].lower() == "from" and (len(rest) == 4 or rest[4].isspace()):
+        parts = rest[4:].split(None, 1)
+        if not parts:
+            raise CommandError("bad_request", f"/invite: from which room? usage: {INVITE_USAGE}")
+        try:
+            source = normalize_room(parts[0])
+        except InvalidName:
+            raise CommandError(
+                "bad_request", f"/invite: {parts[0]!r} isn't a room name, like #build"
+            ) from None
+        rest = parts[1] if len(parts) > 1 else ""
+    note = catchup.clean_text(rest)
+    if len(note) > invites.MAX_NOTE:
+        raise CommandError(
+            "bad_request",
+            f"/invite: the note is too long ({len(note)} characters; at most {invites.MAX_NOTE})",
+        )
+    return Command(name="invite", args=(agent, source, note), raw=raw)
+
+
+def _invite(cmd: Command, room: Room, actor: Actor, svc: "RoomService") -> Result:
+    """Ask an agent in another room to join ``room`` (§43): one message from the person, in
+    that other room, delivered to the agent alone. Nothing joins it: it joins itself."""
+    name, source, note = cmd.args
+    if svc.store.find_member(room.id, name) is not None:
+        raise CommandError("bad_request", f"/invite: {room.name} already has a member named {name}")
+    found = [(m, r) for m, r in svc.invite_candidates(room) if m.name.lower() == name]
+    if source:
+        found = [(m, r) for m, r in found if r.name == source]
+    if not found:
+        where = f" in {source}" if source else " in your other rooms"
+        raise CommandError("not_found", f"/invite: no agent named {name}{where}")
+    agents = {m.participant_id for m, _r in found}
+    if len(agents) > 1:
+        rooms = ", ".join(r.name for _m, r in found)
+        first = found[0][1].name
+        raise CommandError(
+            "bad_request",
+            f"/invite: {name} is a different agent in {rooms}: say which, as /invite {name} from {first}",
+        )
+    member, there = found[0]
+    text = invites.request_text(member.name, room.name, there.name, note)
+    if len(text) > svc.cfg.delivery.max_msg_chars:
+        raise CommandError("bad_request", "/invite: the note is too long for one message")
+    others = tuple(
+        m.membership_id for m in svc.store.members(there.id) if m.membership_id != member.membership_id
+    )
+    who = actor.who(svc.cfg.human_name)
+    svc.human_say(there.name, text, via=actor.via, skip=others, person=(who, actor.person_id))
+    lines = [
+        f"asked {member.name} in {there.name} to join {room.name}; it shows as invited here until it does"
+    ]
+    if there.paused:
+        lines.append(f"{there.name} is paused: {member.name} gets the invitation after /resume there")
+    if member.held:
+        lines.append(f"{member.name} is held in {there.name}: it gets the invitation after /release there")
+    return Result(
+        True,
+        "\n".join(lines),
+        notice=f"invited {member.name} from {there.name}",
+        room_changed=True,
+        event="invite",
+        event_data={"participant": member.participant_id, "name": member.name, "from": there.name, "by": who},
+    )
+
+
+def _uninvite(cmd: Command, room: Room, actor: Actor, svc: "RoomService") -> Result:
+    """Take back a pending invitation (§43), and tell the agent, where it was invited."""
+    name = cmd.args[0]
+    mine = [p for p in svc.invites(room) if str(p["name"]).lower() == name]
+    if not mine:
+        raise CommandError("not_found", f"/uninvite: {name} has no pending invitation to {room.name}")
+    p = mine[-1]
+    there = svc.store.get_room(p["from"]) if isinstance(p["from"], str) else None
+    member = svc.store.find_member(there.id, name) if there is not None else None
+    if there is not None and member is not None and member.participant_id == p["participant"]:
+        others = tuple(
+            m.membership_id for m in svc.store.members(there.id) if m.membership_id != member.membership_id
+        )
+        svc.human_say(
+            there.name,
+            invites.cancel_text(member.name, room.name),
+            via=actor.via,
+            skip=others,
+            person=(actor.who(svc.cfg.human_name), actor.person_id),
+        )
+    return Result(
+        True,
+        f"cancelled {name}'s invitation to {room.name}",
+        notice=f"cancelled the invitation for {name}",
+        room_changed=True,
+        event="invite_cancel",
+        event_data={"participant": p["participant"], "name": name},
+    )
 
 
 def review_request(agents: list[str], url: str, note: str) -> str:
@@ -565,6 +681,10 @@ def apply(cmd: Command, room: Room, actor: Actor, svc: "RoomService") -> Result:
         return _catchup(cmd, room, svc)
     if name == "review":
         return _review(cmd, room, actor, svc)
+    if name == "invite":
+        return _invite(cmd, room, actor, svc)
+    if name == "uninvite":
+        return _uninvite(cmd, room, actor, svc)
     # one-name commands
     target = cmd.args[0]
     member = store.find_member(room.id, target)

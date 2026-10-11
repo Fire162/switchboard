@@ -1509,6 +1509,11 @@ button.nick:hover { text-decoration: underline; text-underline-offset: 2px; }
 .back-btn:hover { background: var(--row-sel); }
 .back-btn .ic { width: 16px; height: 16px; stroke-width: 1.7; }
 .pane-view > .group-label { margin-bottom: -8px; }
+/* an invitation that hasn't been answered yet (§43), and the button that sends one */
+.invite-row { display: flex; align-items: center; gap: 8px; padding: 6px; border-radius: 8px; border: 1px dashed var(--side-border); }
+.invite-row .m-main { flex: 1; min-width: 0; }
+.btn-ghost-sm { height: 26px; padding: 0 10px; font-size: calc(12px * var(--text-scale)); }
+.invite-btn { align-self: flex-start; margin: 2px 6px 0; }
 .group-label { padding: 0 6px; font-size: calc(11.5px * var(--text-scale)); font-weight: 600; color: var(--muted); }
 .sheet-grip { display: block; flex-shrink: 0; align-self: center; width: 36px; height: 5px; margin-top: 7px; border-radius: 3px; background: var(--quote-rule); }
 

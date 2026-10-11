@@ -1185,6 +1185,8 @@ MCP command (the same for every harness): `["<python>","-I","-m","switchboard","
 | `/hold <name>` | Sets `memberships.held`; held messages stay queued | human_cli | engine.evaluate |
 | `/release <name>` | Clears `held` and re-evaluates | human | engine.evaluate |
 | `/catchup <agent> [on <member> \| on "<topic>"] [note]` | Posts one human chat message asking `agent` to get up to speed on a member's work, a topic, or the room, from their session history with its own tool, by a fixed protocol; the subjects get no delivery of it; a `catchup` event (§26) | human_cli (it only posts as the human, like `switchboard say`) | service (`human_say`) |
+| `/invite <agent> [from #room] [note]` | Asks an agent in another open room to join this one: one human chat message in that room, delivered to it alone (every other membership skipped); an `invite` event here, a notice and the room settings pushed (§43) | human (it wakes an agent to bring it into another room) | service (`human_say`) |
+| `/uninvite <agent>` | Takes back a pending invitation: an `invite_cancel` event, a never-mind message to the agent where it was invited (§43) | human_cli | service |
 | `/review <url> [note]` | Opens the room's review board for `url`, as the person, and posts one human chat message that @mentions every agent in the room and asks them to review it on the board (§37.8). Until 0.4 it was `/catchup`'s alias (§26) | human_cli (it posts as the human, like `/catchup`) | service (`human_say`), `Boards` |
 | `/who` | Members: name, harness, status, tier (+note; `verifying...` alone while a Codex thread proof runs, §9.3), away, ⚠/?/env shared, held, queued, in flight, parked, `session: <id> @ <host>` (§26) | human_cli | service |
 | `/status` | Room: paused and reason, budget, hop count; per-agent queued, in-flight and expiry counts; the last 10 rule events; Codex link state; hook hash state; test mode | human_cli | service |
@@ -3075,3 +3077,27 @@ A new room's `budget_per_hour` and `hop_limit` used to come only from `[delivery
 
 ### 42.1 Tests
 `tests/unit/test_db_migrate_v14.py` (the migration; existing preferences rows keep their theme, text size and room rules, and start unset for the two new columns); `tests/unit/test_room_wake_defaults.py` (precedence over config.toml and the built-in default, copy on create in both directions, `set_room_wake`'s notices, events, the shared `hop_limit_notice` wording, and the no-op save); `tests/integration/test_web_preferences.py` (bounds, unknown and wrongly typed values, `null` clearing a default, the theme and text size beside it untouched); `tests/integration/test_web_room_wake.py` (copy on create and each person's own independence, `PUT /api/rooms/{slug}/wake`'s checked bounds, unknown fields, session and Origin/`X-Switchboard` requirements, and the live websocket push and notice); `tests/e2e/test_web_ui.py::test_wake_defaults_copy_into_a_room_and_its_own_dialog_edits_live` (Settings seeding a new room, the room's own dialog changing only that room, the hop-limit-0 warning in both places, the header chips updating live).
+
+## 43. Inviting an agent from another room (#117)
+
+### 43.1 What it is
+An agent gets into a room only by calling `join()` itself (§6.3). To bring one that works in `#build` into `#review` as well, a person used to switch to that agent's own terminal and prompt it there. `/invite` asks it from the web UI: **one message from the person, in a room the agent is already in**, delivered to that agent alone. The agent joins itself. Nothing joins an agent behind its back: switchboard never adds a membership for an agent, and its harness and session stay in charge.
+
+### 43.2 The command (`broker/commands.py`, `switchboard/invites.py`)
+- **`/invite <agent> [from #room] [note]`**, role `human`: it wakes an agent to bring it into another room, a person's call in the web UI, like the commands that raise activity (§10). Agents can't run it (their `/invite` is chat text), so an agent can't spread work or wakes into other rooms.
+- **Who can be invited:** `RoomService.invite_candidates`, every member of the other open rooms that isn't in this room. A name that's a different agent in several rooms is refused, naming them ("say which, as `/invite claude-1 from #build`"). A name already in this room, the same agent or not, is refused, since the invitation tells it to join under its own name.
+- **The message** (`invites.request_text`): `@<agent> Please join #review as well: call join("#review", "<agent>"). You stay in #build.` and `Note: <note>` (at most 300 characters, cleaned like chat text). It carries only switchboard's words, the two rooms' names and the person's note, never text from either room's conversation. It's posted with `human_say` in the agent's room with every other membership in `skip`, so it reaches that agent alone, by every rule for a person's @mention, and waits out a `/pause` or a `/hold` there (the reply says so).
+- **Here:** a notice ("alice invited claude-1 from #build"), an `invite` event (`participant`, `name`, `from`, `by`), and the room's settings pushed.
+- **`/uninvite <agent>`**, role `human_cli` (it only lowers activity): an `invite_cancel` event, and `invites.cancel_text` ("Never mind joining #review: the invitation is cancelled.") to the agent, alone, in the room it was invited from.
+
+### 43.3 Pending, from events
+No new table: `invites.pending` (pure) reads the room's `invite` and `invite_cancel` events of the last `TTL_S` (24 h) through `store.room_events`. An invitation is pending until the agent is a member of the room (it joined), a person cancels it, or it's a day old. A second invitation for the same agent replaces the first. The room's settings carry the list as `invites` (`name`, `from`, `by`, `at`), so the `room` frame brings it to every page, and a join that answers one (`AgentService.join`, when `RoomService.invited`) pushes the settings again, so the row goes at once. `GET /api/rooms/{slug}/invites` (a signed-in session) gives the candidates (name, room, harness, host, status) and the pending list.
+
+### 43.4 The page
+**Invite an agent from another room**, under the agents in Members, opens a dialog: the candidates in a `<select>` grouped by room (`optgroup`), and an optional note. It sends `/invite <agent> from <room> [note]`. Pending invitations show under **Invited**, one row each ("Invited from #build · not joined yet") with **Cancel** (`/uninvite`). The palette lists both commands.
+
+### 43.5 Not in it
+Private rooms (#74) aren't built yet; when they are, an invitation into one also needs the agent's person to be a member. Moving an agent (leaving the room it came from) is a later option.
+
+### 43.6 Tests
+`test_invites.py` (unit: pending, the texts, parsing, the roles); `test_invite_flow.py` (integration: the message reaching the agent alone in its room, the notice and the pending row, the agent joining by itself and the row going, a cancel and its message, the same name in two rooms, a name already here, no such agent, an agent's literal `/invite`); e2e (the dialog by room, the pending row, the join clearing it, Cancel on a phone).

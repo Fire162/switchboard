@@ -1469,6 +1469,22 @@ def install(app: FastAPI, state: "BrokerState") -> None:
         except ServiceError as e:
             return _svc_err(e)
 
+    @app.get("/api/rooms/{slug}/invites")
+    async def invite_candidates(request: Request, slug: str) -> Response:
+        """The agents /invite can ask into this room (§43): the members of the other open rooms,
+        with their room, and the invitations still pending. A signed-in person's, like Members."""
+        if session(request) is None:
+            return unauthorized()
+        try:
+            room = state.service.room(slug)
+            cands = [
+                {"name": m.name, "room": r.name, "harness": m.harness, "host": m.host, "status": m.status}
+                for m, r in state.service.invite_candidates(room)
+            ]
+            return _ok({"room": room.name, "candidates": cands, "pending": state.service.invites(room)})
+        except ServiceError as e:
+            return _svc_err(e)
+
     @app.get("/api/rooms/{slug}/members")
     async def members(request: Request, slug: str) -> Response:
         if session(request) is None:

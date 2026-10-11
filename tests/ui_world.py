@@ -505,6 +505,26 @@ class UIWorld:
 
         b.on_loop(update)
 
+    def agent_join(self, room: str, name: str, other: str) -> dict[str, Any]:
+        """The agent ``add_agents`` joined to ``room`` as ``name`` joins ``other`` as well (#117)."""
+        loop = self._loop
+        assert loop is not None, "UIWorld is not started"
+        agent = self._extra_named.get((room, name))
+        assert agent is not None, f"{name} was not added to UIWorld"
+        b = self.broker
+
+        def test_mode_on() -> None:
+            b.state.test_mode = True
+            b.state.info.test_mode = True
+
+        b.on_loop(test_mode_on)
+        try:
+            joined = asyncio.run_coroutine_threadsafe(agent.join(other, name), loop).result(30)
+        finally:
+            not_test_mode(b)
+        assert joined["ok"], joined
+        return joined
+
     def agent_call(self, room: str, name: str, tool: str, **args: Any) -> dict[str, Any]:
         """Any tool call from an agent joined by ``add_agents`` (the review board's, #80)."""
         loop = self._loop

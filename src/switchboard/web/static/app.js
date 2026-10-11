@@ -240,6 +240,35 @@
           hopsInput.addEventListener('input', validWake);
           form.append(budgetLabel, budgetInput, hopsLabel, hopsInput, wakeWarn, wakeError);
         }
+        let invitePick = null, inviteNote = null;
+        if (options.kind === 'invite') {
+          // the agents in your other rooms, grouped by room (§43)
+          const label = el('label', null, 'Agent');
+          label.setAttribute('for', 'app-dialog-agent');
+          invitePick = el('select');
+          invitePick.id = 'app-dialog-agent';
+          const groups = new Map();
+          for (const c of options.candidates) {
+            if (!groups.has(c.room)) {
+              const g = el('optgroup');
+              g.label = c.room;
+              groups.set(c.room, g);
+              invitePick.append(g);
+            }
+            const o = el('option', null, c.name + (c.host ? '@' + c.host : '') + ' · ' + harnessOf(c.harness)[1]);
+            o.value = c.room + ' ' + c.name;
+            groups.get(c.room).append(o);
+          }
+          const noteLabel = el('label', null, 'Note (optional)');
+          noteLabel.setAttribute('for', 'app-dialog-note');
+          inviteNote = el('input');
+          inviteNote.id = 'app-dialog-note';
+          inviteNote.type = 'text';
+          inviteNote.maxLength = 300;
+          inviteNote.autocomplete = 'off';
+          inviteNote.placeholder = 'to review the tax MR';
+          form.append(label, invitePick, noteLabel, inviteNote);
+        }
         const buttons = el('div', 'app-dialog-buttons');
         const cancel = btn('btn', 'Cancel');
         cancel.id = 'app-dialog-cancel';
@@ -276,6 +305,10 @@
               answer = validName();
               if (!answer) return;
             } else if (options.kind === 'rules') answer = rulesInput.value;
+            else if (options.kind === 'invite') {
+              const v = String(invitePick.value || '').split(' ');
+              answer = { from: v[0], name: v[1], note: String(inviteNote.value || '').trim() };
+            }
             else if (options.kind === 'wake') {
               answer = { budget_per_hour: Number(budgetInput.value), hop_limit: Number(hopsInput.value) };
             } else answer = true;
@@ -289,7 +322,7 @@
         if (validWake) validWake();
         dlg.showModal();
         (settings ? (settingsFocus || $('settings-close'))
-          : (name || rulesInput || budgetInput || (options.danger ? cancel : action))).focus();
+          : (name || rulesInput || budgetInput || invitePick || (options.danger ? cancel : action))).focus();
       });
     });
     dialogQueue = next.then(function () {}, function () {});
@@ -1133,6 +1166,59 @@
     renderApprovalsChip(members);
     renderBuddyPill(members);
     updateTitle();
+    renderInvites();
+  }
+
+  // Agents a person invited from another room that haven't joined yet (§43, #117): one row
+  // each, under the agents, with Cancel. The room frame's settings carry them.
+  function renderInvites() {
+    const r = activeRoom();
+    const pend = r && r.settings && Array.isArray(r.settings.invites) ? r.settings.invites : [];
+    const list = $('buddy-invited');
+    const focused = focusKey(list);
+    list.replaceChildren();
+    $('invited-title').classList.toggle('hidden', !pend.length);
+    list.classList.toggle('hidden', !pend.length);
+    for (const p of pend) {
+      const li = el('li', 'invite-row');
+      li.dataset.name = p.name;
+      const main = el('span', 'm-main');
+      main.append(el('span', 'm-name', p.name),
+        el('span', 'm-status', 'Invited from ' + p.from + ' · not joined yet'));
+      const cancel = btn('btn btn-ghost-sm', 'Cancel');
+      cancel.dataset.focus = 'uninvite:' + p.name;
+      cancel.setAttribute('aria-label', 'Cancel the invitation for ' + p.name);
+      cancel.addEventListener('click', function () { submitText('/uninvite ' + p.name); });
+      li.append(main, cancel);
+      list.append(li);
+    }
+    refocus(list, focused);
+  }
+
+  // Invite an agent (§43): pick one from your other rooms; it gets one message from you there
+  async function openInvite() {
+    const r = activeRoom();
+    if (!r) return;
+    let data;
+    try {
+      data = await api('GET', '/api/rooms/' + encodeURIComponent(r.slug) + '/invites');
+    } catch (e) {
+      await openDialog({ kind: 'notice', title: 'Can’t invite now', body: String(e.message || e), action: 'Close' });
+      return;
+    }
+    const pending = new Set((data.pending || []).map(function (p) { return p.name; }));
+    const candidates = (data.candidates || []).filter(function (c) { return !pending.has(c.name); });
+    if (!candidates.length) {
+      await openDialog({ kind: 'notice', title: 'Nobody to invite',
+        body: 'Invite brings an agent from another of your rooms. None of your other rooms has an agent that isn’t here already.',
+        action: 'Close' });
+      return;
+    }
+    const answer = await openDialog({ kind: 'invite', title: 'Invite an agent to ' + r.name,
+      body: 'It gets one message from you, in the room it’s in, and joins this one itself.',
+      candidates: candidates, action: 'Invite' });
+    if (!answer) return;
+    submitText('/invite ' + answer.name + ' from ' + answer.from + (answer.note ? ' ' + answer.note : ''));
   }
 
   // narrow: the Members pill (people icon, count, and a red badge for agents needing attention)
@@ -1860,6 +1946,11 @@
       detail: 'Raises agent activity, so it needs this signed-in browser.' },
     { group: 'Agents', cmd: 'kick', args: '<name>', desc: 'Remove an agent and revoke its membership', pill: '', usage: '/kick <name>',
       detail: 'Asks first. Removes it from {room} and revokes its membership.' },
+    { group: 'Agents', cmd: 'invite', args: '<agent> [from #room] [note]', desc: 'Ask an agent from another room to join {room}', pill: 'web only',
+      usage: '/invite <agent> [from #room] [note]',
+      detail: 'One message to it, in the room it’s in; it joins itself. Or use Invite under Members.' },
+    { group: 'Agents', cmd: 'uninvite', args: '<agent>', desc: 'Cancel an invitation that hasn’t been answered', pill: '',
+      usage: '/uninvite <agent>', detail: 'The agent is told, where it was invited.' },
     { group: 'Agents', cmd: 'review', args: '<url> [note]', desc: 'Start a review board for a PR or MR', pill: '',
       usage: '/review <url> [note]',
       detail: 'Opens the board here, and one message asks each agent in {room} to review it on the board.' },
@@ -2355,7 +2446,10 @@
     } else if (f.t === 'room') {
       if (!r) return;
       r.settings = f.settings || {};
-      if (f.room === state.active) renderStatus();
+      if (f.room === state.active) {
+        renderStatus();
+        renderInvites();  // an invitation sent, taken back or answered (§43)
+      }
     } else if (f.t === 'notice') {
       if (!f.room || f.room === state.active) renderLocal(f.text, f.level === 'warn');
     } else if (f.t === 'rooms') {
@@ -5138,6 +5232,7 @@
       });
     });
 
+    $('invite-agent').addEventListener('click', openInvite);
     $('me-settings').addEventListener('click', function () { openSettings(); });
     $('remotes-close').addEventListener('click', function () { closeSheet('remotes-panel'); });
     $('add-machine').addEventListener('click', function () { openMachines(null); });

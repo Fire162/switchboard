@@ -1829,6 +1829,47 @@ def test_the_tier_badge_says_how_the_agent_is_woken(ui: UI) -> None:
     )
 
 
+def test_a_person_invites_an_agent_from_another_room(ui: UI) -> None:
+    """#117: Invite lists the agents in your other rooms, by room; the invitation shows as
+    pending here until the agent joins itself, and then it's a member, in both rooms."""
+    src, dst = "e2e-invite-src", "e2e-invite-dst"
+    ui.world.create_room("#" + src)
+    ui.world.create_room("#" + dst)
+    ui.world.add_agents("#" + src, ("helper",))
+    page = ui.open(room=dst)
+    page.click("#invite-agent")
+    dialog = page.locator("#app-dialog")
+    expect(dialog.locator("h2")).to_have_text(f"Invite an agent to #{dst}")
+    pick = dialog.locator("#app-dialog-agent")
+    expect(pick).to_be_focused()
+    expect(pick.locator(f'optgroup[label="#{src}"] option')).to_have_count(1)
+    pick.select_option(f"#{src} helper")
+    dialog.locator("#app-dialog-note").fill("to review the tax MR")
+    page.click("#app-dialog-action")
+    row = page.locator('#buddy-invited .invite-row[data-name="helper"]')
+    expect(row).to_contain_text(f"Invited from #{src} · not joined yet")
+    expect(page.locator("#log .line.local").last).to_contain_text(f"asked helper in #{src} to join #{dst}")
+    ui.world.agent_join("#" + src, "helper", "#" + dst)
+    expect(row).to_have_count(0)
+    expect(page.locator('#buddy-list .member[data-name="helper"]')).to_be_visible()
+    expect(page.locator("#invited-title")).to_be_hidden()
+
+
+def test_a_pending_invitation_can_be_cancelled(ui: UI) -> None:
+    src, dst = "e2e-uninvite-src", "e2e-uninvite-dst"
+    ui.world.create_room("#" + src)
+    ui.world.create_room("#" + dst)
+    ui.world.add_agents("#" + src, ("asked-once",))
+    assert ui.world.command(dst, f"/invite asked-once from #{src}")["ok"]
+    page = ui.open(room=dst, **PHONE)
+    page.click("#buddy-toggle")
+    row = page.locator('#buddy-invited .invite-row[data-name="asked-once"]')
+    expect(row).to_be_visible()
+    no_horizontal_scroll(page)
+    row.get_by_role("button", name="Cancel the invitation for asked-once").click()
+    expect(row).to_have_count(0)
+
+
 def test_empty_room_copy_keeps_its_icon(ui: UI) -> None:
     """The join hint's Copy button changes only its label: it used to lose its icon for good."""
     ui.world.create_room("#e2e-copy")  # a room of its own: nobody in it and nothing said

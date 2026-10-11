@@ -17,7 +17,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from switchboard import __version__, build_info, db
+from switchboard import __version__, build_info, db, invites
 from switchboard.broker import catchup
 from switchboard.broker import commands as cmds
 from switchboard.broker.commands import Actor, CommandError
@@ -273,7 +273,32 @@ class RoomService:
             "hop_count": room.hop_count,
             "hop_limit": room.hop_limit,
             "test_mode": self.info.test_mode,
+            # agents a person asked to join, that haven't yet (§43, #117)
+            "invites": self.invites(room),
         }
+
+    # ------------------------------------------------------------ invitations (§43)
+    def invites(self, room: Room) -> list[dict[str, Any]]:
+        """The room's pending invitations (``invites.pending``)."""
+        now = self.clock.now()
+        evs = self.store.room_events(room.id, ("invite", "invite_cancel"), now - invites.TTL_S)
+        members = {m.participant_id for m in self.store.members(room.id)}
+        return invites.pending([{"ts": e.ts, "kind": e.kind, "data": e.data} for e in evs], now, members)
+
+    def invited(self, room: Room, participant_id: int) -> bool:
+        """Was ``participant_id`` invited to ``room`` within the invitation's lifetime?"""
+        evs = self.store.room_events(room.id, ("invite",), self.clock.now() - invites.TTL_S)
+        return any(e.data.get("participant") == participant_id for e in evs)
+
+    def invite_candidates(self, room: Room) -> list[tuple[Member, Room]]:
+        """The agents ``/invite`` can ask into ``room``: every member of the other open rooms
+        that isn't in ``room`` already, with the room it's in, in room order."""
+        here = {m.participant_id for m in self.store.members(room.id)}
+        out: list[tuple[Member, Room]] = []
+        for r in self.store.list_rooms():
+            if r.id != room.id:
+                out += [(m, r) for m in self.store.members(r.id) if m.participant_id not in here]
+        return out
 
     def room_dict(self, room: Room) -> dict[str, Any]:
         return {

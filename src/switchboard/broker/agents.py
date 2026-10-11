@@ -816,6 +816,9 @@ class AgentService:
             room_rules=room.rules_text,
         )
         self.store.mark_rules_seen(m.id, room.rules_version)
+        if self.svc.invited(room, p.id):
+            # an invitation it answered (§43): every page showing the room drops its pending row
+            self.svc.hub.room_settings(room.name, self.svc.settings(room))
         self.run(self.engine.evaluate(m.id) + [Snapshot(room.id)])
         return {
             "cred": cred,

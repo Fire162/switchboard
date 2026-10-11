@@ -679,6 +679,16 @@ class Store:
         args.append(limit)
         return [Event.from_row(r) for r in self.con.execute(sql, args).fetchall()]
 
+    def room_events(self, room_id: int, kinds: Iterable[str], since: float) -> list[Event]:
+        """The room's events of ``kinds`` from ``since`` on, oldest first (§43's invitations)."""
+        kinds = list(kinds)
+        rows = self.con.execute(
+            f"SELECT * FROM events WHERE room_id=? AND kind IN ({','.join('?' * len(kinds))})"
+            " AND ts>=? ORDER BY id",
+            (room_id, *kinds, since),
+        ).fetchall()
+        return [Event.from_row(r) for r in rows]
+
     # ------------------------------------------------------------ web sessions
     def web_session_create(
         self, id_hash: str, ttl_s: float, via: str | None = None, person_id: int | None = None
