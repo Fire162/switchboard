@@ -86,7 +86,7 @@ Beside these is the [security model](../CLAUDE.md#the-security-model-in-short) (
 
 ### Where the code doesn't follow them yet
 
-Each is an open issue; don't copy the pattern, and the fix removes its mention here. Harness branches outside the adapters: the engine ([#169](https://github.com/amahpour/switchboard/issues/169); which hooks set a session id or an approval mode, and Claude's `/clear`, moved to the adapters), and `agents.py`'s `mcp.hello`/attach branches ([#170](https://github.com/amahpour/switchboard/issues/170); Codex session keys and binding and the Cursor branches moved to their adapters).
+Each is an open issue; don't copy the pattern, and the fix removes its mention here. Harness branches outside the adapters: the engine ([#169](https://github.com/amahpour/switchboard/issues/169); which hooks set a session id or an approval mode, Claude's `/clear`, and Devin's subagent taint and Stop re-arm, moved to the adapters), and `agents.py`'s `mcp.hello`/attach branches ([#170](https://github.com/amahpour/switchboard/issues/170); Codex session keys and binding and the Cursor branches moved to their adapters).
 
 ## Where to read next in DESIGN.md
 
