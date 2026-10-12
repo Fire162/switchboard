@@ -37,8 +37,6 @@ from typing import Any
 
 from switchboard import envelope
 from switchboard.adapters.base import Adapter
-from switchboard.adapters.cursor import FOLLOWUP_RACE_S
-from switchboard.adapters.devin import rearm_text as devin_rearm_text
 from switchboard.clock import Clock
 from switchboard.config import Config
 from switchboard.delivery import rules
@@ -148,12 +146,13 @@ class Engine:
         return self.adapter_for(p.harness, getattr(p, "host", ""))
 
     def adapter_for(self, harness: str, host: str = "") -> Adapter:
-        """The adapter of a ``harness`` session on ``host`` ('' for this machine). A Codex
-        session on another host has its own pull-only adapter (DESIGN.md §27.7): the
-        Codex push paths all talk to this machine's app-server."""
-        if harness == "codex" and host:
-            return self.adapters.get("codex@remote") or self.adapters["unknown"]
-        return self.adapters.get(harness) or self.adapters["unknown"]
+        """The adapter of a ``harness`` session on ``host`` ('' for this machine). A harness
+        whose push paths reach only this machine (Codex's app-server) has a pull-only
+        adapter for its sessions on other hosts (DESIGN.md §27.7)."""
+        adapter = self.adapters.get(harness) or self.adapters["unknown"]
+        if host and adapter.local_only:
+            return self.adapters.get(f"{harness}@remote") or self.adapters["unknown"]
+        return adapter
 
     def token(self, b: Batch) -> str:
         return envelope.batch_token(self.key, b.id, b.membership_id)
@@ -616,16 +615,12 @@ class Engine:
 
     def _arm_pull(self, b: Batch, p: Participant) -> list[Action]:
         """How a pull batch (wait/read/say) will be confirmed (§8.7, §9.6)."""
-        if p.harness == "test":
-            mode = self.ack_modes.get(p.id, "next_call")
-            if mode == "immediate":
-                return self.on_confirm(b.id, "test:immediate")
-            if mode == "never":
-                self.pull_deadlines[b.id] = self.now() + self.d.pull_ack_s
-            return []
-        if p.hooks_seen_at is not None:
+        ack = self.adapter(p).pull_ack(p, self.ack_modes.get(p.id))
+        if ack == "immediate":
+            return self.on_confirm(b.id, f"{p.harness}:immediate")
+        if ack == "never" or (ack == "hooks" and p.hooks_seen_at is not None):
             self.pull_deadlines[b.id] = self.now() + self.d.pull_ack_s
-        # no hooks ever seen: the member's next switchboard call confirms it
+        # next_call, or no hooks ever seen: the member's next switchboard call confirms it
         return []
 
     # ========================================================== confirmation
@@ -719,19 +714,16 @@ class Engine:
             cont is not None
             and b.path == "stop_followup"
             and state == "expired"
-            and self._missed(cont, reason)
+            and self._missed(m, cont, reason)
         ):
             out += self._followup_expired(m, reason)
         again = self.evaluate_participant(m.participant_id) if push else self.evaluate(m.id)
         return out + again + [Snapshot(m.room_id)]
 
-    def _missed(self, cont: Cont, reason: str) -> bool:
-        """Does this expiry count as a follow-up Cursor never ran? The human typing
-        right after it was printed is a race, not evidence (§9.4); typing a while
-        later, with no hook of the follow-up turn in between, is."""
-        if reason != "human_prompt":
-            return True
-        return cont.acked_at is not None and self.now() - cont.acked_at >= FOLLOWUP_RACE_S
+    def _missed(self, m: Membership, cont: Cont, reason: str) -> bool:
+        """Does this expiry count as a stop follow-up the harness never ran (§9.4)?"""
+        p = self.store.get_participant(m.participant_id)
+        return p is not None and self.adapter(p).followup_missed(cont.acked_at, reason, self.now())
 
     def _undo_stop_busy(self, participant_id: int, since: float, src: str) -> list[Action]:
         """A stop continuation or re-arm set the member busy (a turn should start).
@@ -745,32 +737,26 @@ class Engine:
         return self.set_status(p, "idle", src, bump=True)
 
     def _followup_expired(self, m: Membership, reason: str) -> list[Action]:
-        """A Cursor follow-up that was never confirmed. After
-        ``max_unconfirmed_followups`` in a row the member is degraded: no more
-        parks until the human's next prompt in that session (§9.4)."""
+        """A stop follow-up that was never confirmed. After the adapter's
+        ``followup_limit`` in a row the member is degraded: no more parks until the
+        human's next prompt in that session (Cursor, §9.4)."""
         p = self.store.get_participant(m.participant_id)
         if p is None:
             return []  # pragma: no cover - participant rows are never deleted
+        adapter = self.adapter(p)
         n = p.unconfirmed_followups + 1
         self.store.update_participant(p.id, unconfirmed_followups=n)
-        limit = self.cfg.cursor.max_unconfirmed_followups
+        limit = adapter.followup_limit()
         out: list[Action] = []
         if limit and n == limit:
             self._event("tier", participant_id=p.id, what="degraded", reason=reason, n=n)
-            out.append(
-                Notice(
-                    m.room_id,
-                    "warn",
-                    f"{m.screen_name}: {n} stop follow-ups in a row were not confirmed; no more"
-                    " follow-ups until your next prompt in that Cursor session",
-                )
-            )
+            out.append(Notice(m.room_id, "warn", adapter.degraded_text(m.screen_name, n)))
         return out + self.refresh_tier(p.id)
 
     def refresh_tier(self, participant_id: int) -> list[Action]:
         """Re-derive a participant's tier from its adapter (binding, degraded, ...)."""
         p = self.store.get_participant(participant_id)
-        if p is None or p.harness not in ("cursor", "devin"):
+        if p is None or not self.adapter(p).derives_tier:
             return []
         tier, note = self.adapter(p).tier(p)
         if (tier, note) == (p.tier, p.tier_note):
@@ -799,14 +785,11 @@ class Engine:
 
     def before_call(self, p: Participant) -> list[Action]:
         """An agent.* call is evidence that earlier pull answers reached the model
-        when there is no hook to say so (test ``--ack next_call``; hook-less harnesses).
+        when there is no hook to say so (``pull_ack`` ``next_call``; hook-less sessions).
         It also confirms the session's acked stop continuations (``_call_confirms``)."""
         out = self._call_confirms(p)
-        mode = self.ack_modes.get(p.id) if p.harness == "test" else None
-        if p.harness == "test":
-            if mode not in (None, "next_call"):
-                return out
-        elif p.hooks_seen_at is not None:
+        ack = self.adapter(p).pull_ack(p, self.ack_modes.get(p.id))
+        if ack in ("immediate", "never") or (ack == "hooks" and p.hooks_seen_at is not None):
             return out
         for m in self.store.participant_memberships(p.id):
             for b in self.store.offered_batches(m.id, PULL_PATHS):
@@ -982,11 +965,10 @@ class Engine:
         # loops wait() inside one prompt (Claude when idle, Devin's wait loop)
         # would otherwise get one chatter batch per prompt and then only
         # timeouts. Wakes stay bounded by the budget and the loop guard.
-        if p.harness == "test" or p.hooks_seen_at is None:
+        sink_status = self.adapter(p).sink_status
+        if sink_status or p.hooks_seen_at is None:
             # status is inferred from sinks
-            self.store.set_status(
-                p.id, "idle" if p.harness == "test" else p.status, "sink", bump_boundary=True
-            )
+            self.store.set_status(p.id, "idle" if sink_status else p.status, "sink", bump_boundary=True)
         else:
             self.store.bump_boundary(p.id)
         out += self.evaluate(m.id)
@@ -1029,7 +1011,7 @@ class Engine:
         s = self.sinks.close(sink.id, result, reason)
         if s is not None:
             p = self.store.get_participant(s.participant_id)
-            if p is not None and p.harness == "test" and p.status == "idle" and p.active:
+            if p is not None and self.adapter(p).sink_status and p.status == "idle" and p.active:
                 self.store.set_status(p.id, "busy", "sink")
         return ResolveSink(sink.id, result or {"status": "cancelled"})
 
@@ -1230,20 +1212,12 @@ class Engine:
         adapter = self.adapter(p)
         was_idle = p.status in ("idle", "starting")
         upd: dict[str, Any] = {"hooks_seen_at": now, "last_seen": now}
-        if ev.sid and p.harness in ("claude", "devin", "test"):
+        if ev.sid and adapter.reports_session_id:
             upd["session_id"] = ev.sid[:128]
-        if ev.permission_mode and p.harness in ("claude", "codex"):
+        if ev.permission_mode and adapter.reports_approval_mode:
             upd["approval_mode"] = approval_mode_of(ev.permission_mode)
-        # Codex: input steered into a running turn (a turn/steer, or a turn/start
-        # merged into a busy turn) fires UserPromptSubmit with that turn's own id.
-        # It is mid-turn input, not a new turn (M4 live).
-        mid_turn = (
-            E == "UserPromptSubmit"
-            and p.harness == "codex"
-            and bool(ev.gen)
-            and (ev.gen or "")[:128] == p.gen
-            and not was_idle
-        )
+        # input into the running turn (Codex's steers) is not a new turn
+        mid_turn = adapter.is_mid_turn(p, ev, was_idle)
         gen = (ev.gen or "")[:128] or None
         if E == "UserPromptSubmit" and not mid_turn:
             upd.update(
@@ -1251,16 +1225,13 @@ class Engine:
                 gen_tainted=int(gen is not None and gen in self.tainted_gens.get(p.id, {})),
                 rearms_in_gen=0,
             )
-            limit = self.cfg.cursor.max_unconfirmed_followups
-            if (
-                p.harness == "cursor"
-                and p.unconfirmed_followups
-                and (not limit or p.unconfirmed_followups >= limit)
-            ):
+            # only a harness with stop follow-ups (Cursor) counts unconfirmed ones
+            limit = adapter.followup_limit()
+            if p.unconfirmed_followups and (not limit or p.unconfirmed_followups >= limit):
                 # the human's prompt ends a degraded spell (§9.4); below the limit the
                 # count stands: only a confirmed follow-up breaks a run of misses
                 upd["unconfirmed_followups"] = 0
-        if E == "PreToolUse" and ev.subagent_bg and p.harness == "devin":
+        if adapter.starts_subagent(ev):
             self._taint(p.id, gen or p.gen)
             if gen is None or gen == p.gen:
                 upd["gen_tainted"] = 1
@@ -1272,11 +1243,10 @@ class Engine:
         adapter.on_hook(p, ev)
         if "unconfirmed_followups" in upd:
             out += self.refresh_tier(p.id)
-        # Devin: a hook of a prompt that started a background subagent may be the
-        # subagent's (F§6 5.2): no context, no continue, no re-deliver for it.
-        tainted = p.harness == "devin" and (
-            bool(p.gen_tainted) or (gen is not None and gen in self.tainted_gens.get(p.id, {}))
-        )
+        # A hook of a prompt that started a background subagent may be the subagent's
+        # (Devin, F§6 5.2): no context, no continue, no re-deliver for it. Only
+        # ``adapter.starts_subagent`` taints a prompt, so only such a harness has one.
+        tainted = bool(p.gen_tainted) or (gen is not None and gen in self.tainted_gens.get(p.id, {}))
         stale_sub = tainted and gen is not None and gen != p.gen
         if not stale_sub:
             # A parked stop hook of this session ends at any hook of it: a newer
@@ -1356,7 +1326,7 @@ class Engine:
             if not tainted:
                 new, bump = "idle", p.status != "idle"
         elif E == "SessionEnd":
-            if not (p.harness == "claude" and ev.reason == "clear"):
+            if adapter.ends_session(ev):
                 new = "offline"
         p = self.store.get_participant(p.id) or p
         if new is not None and (p.status != "waiting-approval" or new == "offline"):
@@ -1402,7 +1372,7 @@ class Engine:
         return out
 
     def _taint(self, participant_id: int, gen: str | None) -> None:
-        """Remember a Devin prompt that started a background subagent (newest last, capped)."""
+        """Remember a prompt that started a background subagent (newest last, capped)."""
         if not gen:
             return
         gens = self.tainted_gens.setdefault(participant_id, {})
@@ -1523,15 +1493,15 @@ class Engine:
             if rel.counted:
                 out += self._after_counted(room.id)
             return HookOut("continue", text, b.id, ack), out + [Snapshot(room.id)]
-        dv = self.cfg.devin
-        if not dv.rearm or p.rearms_in_gen >= dv.rearm_max_per_prompt:
+        per_prompt, per_hour = adapter.rearm_caps()
+        if p.rearms_in_gen >= per_prompt:
             return None, out
         # a per-session hourly cap on top of the per-prompt one: re-arms spend the
         # room's shared budget, and the per-prompt count resets at every prompt
         now = self.now()
         recent = [t for t in self.rearm_log.get(p.id, []) if now - t < REARM_WINDOW_S]
         self.rearm_log[p.id] = recent
-        if len(recent) >= dv.rearm_max_per_hour:
+        if len(recent) >= per_hour:
             return None, out
         for m in ms:
             room = self.store.refill_budget(m.room_id)
@@ -1546,7 +1516,7 @@ class Engine:
             out += self.set_status(p, "busy", "stop:rearm")
             self.rearm_busy[p.id] = now
             out += self._after_counted(room.id)
-            text = devin_rearm_text(room.name, caps.wait_cap_s)
+            text = adapter.rearm_text(room.name, caps.wait_cap_s)
             return HookOut("continue", text), out + [Snapshot(room.id)]
         return None, out
 

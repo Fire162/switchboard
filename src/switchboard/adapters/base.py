@@ -82,6 +82,20 @@ class Adapter:
     # At most one unconfirmed push frame per session, across its rooms (Claude:
     # a second frame would queue behind the turn the first one starts).
     serial_push = False
+    # What this harness's hooks may set on the session (§6.3): its own session id (one the
+    # history tools know it by), and its approval mode (only Claude's and Codex's hooks carry
+    # a ``permission_mode``).
+    reports_session_id = False
+    reports_approval_mode = False
+    # Its push paths reach only this machine: a session on another host takes the pull-only
+    # adapter registered as ``<harness>@remote``, or the unknown harness's (Codex, §27.7).
+    local_only = False
+    # Its status is inferred from its sinks, not its hooks: an open wait() is idle, anything
+    # else busy (the scripted test agent, §9.6).
+    sink_status = False
+    # Its tier follows from the participant row alone (Cursor's binding and degraded spell,
+    # Devin's wait loop), so the engine re-derives it when the row changes (§9.4).
+    derives_tier = False
 
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -122,6 +136,26 @@ class Adapter:
         (Cursor: a fresh or unbound row starts ``pending`` until its conversation binds
         it)."""
         return {}
+
+    def join_conflict(self, store: Any, thread_id: str | None, host: str) -> str | None:
+        """Why this verified identity cannot join on ``host``, or None."""
+        return None
+
+    def rebind_fields(self, existing: Participant | None, *, same_mcp: bool) -> dict[str, Any]:
+        """Fields to reset when a join moves to another MCP process."""
+        return {}
+
+    def credential_error(self, p: Participant, params: dict[str, Any]) -> str | None:
+        """Why this call's harness identity does not match its membership credential."""
+        return None
+
+    def keep_on_mcp_disconnect(self, p: Participant) -> bool:
+        """Whether another channel keeps this session's status after MCP disconnects."""
+        return False
+
+    def rejoin_notice(self, p: Participant, name: str, *, same_mcp: bool) -> str | None:
+        """A notice for a rotated membership after an MCP process change, or None."""
+        return None
 
     def conversation_kicked(self, store: Any, room_id: int, p: Participant) -> bool:
         """True if this session's larger identity (Cursor: its bound conversation) was
@@ -183,6 +217,13 @@ class Adapter:
         switchboard keeps no history-tool id for."""
         return None, "a session of an unknown harness"
 
+    def pull_ack(self, p: Participant, mode: str | None) -> str:
+        """How a wait/read/say answer to ``p`` is confirmed (§8.7): ``hooks`` (its hooks,
+        or its next switchboard call while none were ever seen), ``next_call``,
+        ``immediate`` or ``never``. ``mode`` is the ``--ack`` its MCP server claimed (§9.6),
+        which only the test agent's adapter takes."""
+        return "hooks"
+
     # -- routing (pure) -----------------------------------------------------
     def route(self, p: Participant, rel: Release, sink: Any, now: float) -> Route:
         raise NotImplementedError
@@ -190,6 +231,22 @@ class Adapter:
     def on_hook(self, p: Participant, ev: HookEvent) -> dict[str, Any] | None:
         """Harness-specific side effects of a hook event (Codex: holds, thread proof)."""
         return None
+
+    def is_mid_turn(self, p: Participant, ev: HookEvent, was_idle: bool) -> bool:
+        """True if this UserPromptSubmit is input into the running turn, not a new turn
+        (Codex's steered input, §9.3): the prompt id, the taint and the pull answers stay."""
+        return False
+
+    def starts_subagent(self, ev: HookEvent) -> bool:
+        """True if this hook starts a background subagent whose hooks carry the prompt's own
+        ids (Devin's ``run_subagent``, §9.5): the engine taints that prompt, so no context,
+        continue or re-delivery can reach the subagent."""
+        return False
+
+    def ends_session(self, ev: HookEvent) -> bool:
+        """True if this SessionEnd takes the session offline (§7.4). Claude's ``/clear``
+        keeps the process and its binding, so its ``reason=clear`` doesn't."""
+        return True
 
     # -- stop-time delivery (M5: Cursor stop park, Devin Stop block) ----------
     def park_s(self, p: Participant, ev: HookEvent) -> float | None:
@@ -199,6 +256,31 @@ class Adapter:
     def stop_continues(self, p: Participant) -> bool:
         """True if this harness's Stop hook may return a continue at once (Devin)."""
         return False
+
+    def followup_limit(self) -> int:
+        """Unconfirmed stop follow-ups in a row that degrade the session: no more parks
+        until the human's next prompt in it (Cursor, §9.4). 0: never."""
+        return 0
+
+    def followup_missed(self, acked_at: float | None, reason: str, now: float) -> bool:
+        """True if this expiry counts as a stop follow-up the harness never ran."""
+        return True
+
+    def degraded_text(self, name: str, n: int) -> str:
+        """The warn notice when ``followup_limit`` misses in a row degrade the session."""
+        return (
+            f"{name}: {n} stop follow-ups in a row were not confirmed; no more follow-ups"
+            " until your next prompt"
+        )
+
+    def rearm_caps(self) -> tuple[int, int]:
+        """How many "keep listening" re-arms a Stop with nothing to deliver may return:
+        ``(per prompt, per hour)`` for one session, ``(0, 0)`` for none (Devin, §9.5)."""
+        return 0, 0
+
+    def rearm_text(self, room: str, wait_s: int) -> str:
+        """The re-arm a Stop continues with, when ``rearm_caps`` allows one."""
+        raise NotImplementedError(f"{self.harness} has no Stop re-arm")
 
     def redeliver_on_stop(self, p: Participant, ev: HookEvent) -> bool:
         """Stop re-delivers unanswered priority items once (§8.5) unless this says no."""

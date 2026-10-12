@@ -56,6 +56,8 @@ def rearm_text(room: str, wait_s: int) -> str:
 
 class DevinAdapter(Adapter):
     harness = "devin"
+    reports_session_id = True  # the hooks' session_id is the one the history tools know
+    derives_tier = True
 
     def tier(self, p: Participant | None) -> tuple[str, str | None]:
         return TIER, None
@@ -92,8 +94,18 @@ class DevinAdapter(Adapter):
         return Route("none", reason="not listening: no wait() open and the Stop re-arm is used up")
 
     # --------------------------------------------------------------- hooks
+    def starts_subagent(self, ev: HookEvent) -> bool:
+        return ev.ev == "PreToolUse" and ev.subagent_bg
+
     def stop_continues(self, p: Participant) -> bool:
         return True
+
+    def rearm_caps(self) -> tuple[int, int]:
+        dv = self.cfg.devin
+        return (dv.rearm_max_per_prompt, dv.rearm_max_per_hour) if dv.rearm else (0, 0)
+
+    def rearm_text(self, room: str, wait_s: int) -> str:
+        return rearm_text(room, wait_s)
 
     def redeliver_on_stop(self, p: Participant, ev: HookEvent) -> bool:
         return not p.gen_tainted

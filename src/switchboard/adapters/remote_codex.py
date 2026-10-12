@@ -36,6 +36,7 @@ import asyncio
 from typing import Any
 
 from switchboard.adapters.base import HOOK_CONTEXT_EVENTS, PullAdapter, SendError
+from switchboard.adapters.codex import CodexMembership, steered
 from switchboard.clock import Clock, SystemClock
 from switchboard.config import Config
 from switchboard.models import Batch, HookEvent, Participant, Release, Route, split_session_key
@@ -65,8 +66,9 @@ def thread_of(p: Participant) -> str:
     return parts[2] if parts is not None and parts[0] == "codex" and parts[1] else ""
 
 
-class RemoteCodexAdapter(PullAdapter):
+class RemoteCodexAdapter(CodexMembership, PullAdapter):
     serial_push = True  # one wake in flight per thread
+    reports_approval_mode = True  # as a Codex session here (§9.3)
 
     def __init__(self, cfg: Config):
         super().__init__("codex", cfg)
@@ -171,6 +173,9 @@ class RemoteCodexAdapter(PullAdapter):
         if self._backing_off(p, now):
             return Route("defer", reason="the wake failed on its machine; retrying")
         return Route("push", path=PATH)
+
+    def is_mid_turn(self, p: Participant, ev: HookEvent, was_idle: bool) -> bool:
+        return steered(p, ev, was_idle)
 
     def on_hook(self, p: Participant, ev: HookEvent) -> dict[str, Any] | None:
         E = ev.ev

@@ -702,6 +702,12 @@ Rules, in order:
 | Devin | `devin:<acp_pid>@<acp_start>` | the hooks' `session_id` | Hooks resolve by ancestry. `/new` and `/clear` respawn acp and the MCP server, which ends the old participant (below); the agent must re-join. |
 | test | `test:<--test-session KEY>` | – | status is inferred from sinks |
 
+`CodexMembership` in `adapters/codex.py` supplies the local and remote Codex adapters with
+the thread key, the cross-host check, credential-to-thread binding, proof reset on MCP takeover,
+and reconnect notice. `AgentService` still checks the common process takeover rule before it
+persists a join. A local Codex thread stays under `CodexLink` when its MCP connection closes;
+the remote adapter lets that participant go offline.
+
 **Re-joining a session** (the same `session_key`) rotates its credential and takes over its memberships only from the MCP process that holds it (a broker reconnect), or once that MCP process is gone (an MCP restart), and never while another live agent process holds the session. Otherwise `join` fails with `conflict`. Once the holder is gone, what the resuming process gets depends on whether the liveness sweep (every `LIVENESS_S` = 2 s) has ended the old session yet. Both outcomes are intended, and in both the resuming process becomes the thread's only active participant:
   - **Not ended yet:** it takes over the still-active membership ("You rejoined", same membership, credential rotated).
   - **Already ended:** the join is fresh ("You joined", a new membership).
@@ -1011,10 +1017,20 @@ class Adapter(ABC):
     def join_guidance(self, p) -> str
     def route(self, p, rel: Release, sinks, now) -> Route         # PURE: push(path) | sink(id, path) | pull | none(reason)
     def on_hook(self, p, ev: HookEvent) -> HookDecision | None    # harness gating (Cursor stop status, Devin taint)
+    reports_session_id: bool; reports_approval_mode: bool         # what its hooks may set (claude, devin, test; claude, codex)
+    def ends_session(self, ev) -> bool                            # SessionEnd → offline (not Claude's reason=clear)
+    def starts_subagent(self, ev) -> bool                         # taints the prompt (Devin's background run_subagent)
+    def rearm_caps(self) -> tuple[int, int]; def rearm_text(self, room, wait_s) -> str   # Stop re-arm (Devin)
+    def followup_limit(self) -> int; def followup_missed(self, acked_at, reason, now) -> bool
+    def degraded_text(self, name, n) -> str                       # missed stop follow-ups degrade (Cursor)
+    derives_tier: bool                                            # tier follows from the row (Cursor, Devin)
+    def is_mid_turn(self, p, ev, was_idle) -> bool                # input steered into the running turn (Codex)
+    local_only: bool                                              # another host's session takes <harness>@remote (Codex)
+    def pull_ack(self, p, mode) -> str; sink_status: bool         # pull confirmation, status from sinks (test agent)
     async def send(self, p, batch, text) -> None                  # transport for push routes
     async def start(self, runner) -> None; async def stop(self) -> None   # background status sources
 ```
-`claim_for_hook(pid, ev)` updates status first. It then calls `adapter.on_hook`, then `rules.releasable`, and returns a `HookOut(kind, text, batch_id, ack)` only for events that §7.3 allows to print. Every re-evaluation the event triggers (its confirmations, expiries and the status change) runs once at the end, after the status is set and the event's own context was claimed (M3 review fix).
+The engine asks the adapter these questions rather than branching on the harness name, so a harness's quirks live in its adapter (#169). `tests/unit/test_engine_names_no_harness.py` fails on a harness name in `delivery/engine.py` (a string outside a docstring, a comparison with `.harness`, an import from a harness's adapter module). `claim_for_hook(pid, ev)` updates status first. It then calls `adapter.on_hook`, then `rules.releasable`, and returns a `HookOut(kind, text, batch_id, ack)` only for events that §7.3 allows to print. Every re-evaluation the event triggers (its confirmations, expiries and the status change) runs once at the end, after the status is set and the event's own context was claimed (M3 review fix).
 
 ### 9.2 Claude (M3), tiers `claude:inbox` and `claude:hook`
 - **Tier choice.** `claude:inbox` needs a verified MCP peer (§5.3), `has_messaging_token`, a successful `mcp.attach`, and the local refusal guard passing. Otherwise the tier is `claude:hook`.
@@ -1121,8 +1137,8 @@ class Adapter(ABC):
 
 ### 9.6 Test agent (M2), tier `mcp-only`
 `switchboard mcp --harness test --test-session KEY --ack next_call|immediate|never` works only against a test-mode broker.
-- Status is inferred from sinks.
-- `--ack` sets how pull batches are confirmed:
+- Status is inferred from sinks (`sink_status`).
+- `--ack` sets how pull batches are confirmed (`pull_ack`):
   - `immediate`: on answer;
   - `next_call` (default): on the member's next `agent.*` call;
   - `never`: expire after `pull_ack_s`, which proves never-skip.
@@ -2833,7 +2849,7 @@ UPDATE meta SET value='4' WHERE key='schema_version';
 - **Passwords.** The standard library's scrypt (n=2^14, r=8, p=1, a 16-byte salt), stored as `scrypt$…`, compared in constant time (`broker/passwords.py`). A chosen password: at least 10 characters, at most 256, more than two different characters, not the name, not shaped like a one-time password, and not in the bundled common-password blocklist (case-insensitive) or a season-plus-year pattern. The blocklist contains SHA-256 digests of 9,126 eligible entries from the NCSC 100k list; its source, checksum and Open Government Licence attribution are in `broker/common_passwords.NOTICE`. A rejection says to choose a less common password.
 - **One-time passwords.** 16 Crockford base32 characters in four groups (80 bits), read back as typed (any case, with or without dashes, I and L for 1, O for 0). The admin's is the claim token (§31.3): only its SHA-256 is kept, in memory, spent by the claim, a new one every hour while unclaimed. A person's is scrypt-hashed in their row with `must_reset` and `password_expires_at` (7 days).
 - **`POST /api/signin/password {name, password}`.** `name` is who signs in: an email once the admin has set one for that account, a name until then (§39). The admin is also always `admin`. The admin's one-time password starts the claim's ceremony (a cookie, as a passkey claim's) and answers `next: setup`; `/setup` then offers **Choose how you'll sign in**: `POST /api/setup/password` (the claim with a password) or `/api/setup/begin` and `/finish` (with a passkey, as in §31.3, now also without the token when the ceremony is bound). A person's one-time password gives a session whose person `must_reset`: every other route answers it 401, `/` and `/setup` serve the Choose page, and `POST /api/me/password` or adding a passkey clears it (a passkey instead clears the one-time password too). An expired one answers `expired`. Anything else wrong is "wrong email or password", after exactly one scrypt check (#179): the real hash when the name or email is someone's and they have one, the dummy hash otherwise — never both (a wrong password used to cost two, the real hash then the dummy one) and never neither (an unknown, empty, or passwordless-admin name used to cost none), so the time says nothing about who's real.
-- **The limiter** (`SignInLimiter`, in memory): after 5 failures for an account in 15 minutes, that account waits 30 s, doubling to 15 minutes, before its next try (429, `slow_down`). Later failures keep the backoff, one try per 15 minutes at the cap, until a success or 24 hours quiet. `admin`, the owner's name and email share the owner bucket; a person's name or email and their signed-in password check share `person:<id>`. Unknown names have their own name bucket. More than 100 failures a minute over all names pause every password sign-in for 10 s. A success clears the account.
+- **The limiter** (`SignInLimiter`, in memory): after 5 failures for an account in 15 minutes, that account waits 30 s, doubling to 15 minutes, before its next try (429, `slow_down`). Later failures keep the backoff until a success or 24 hours quiet. `admin`, the owner's name and email share the owner bucket; a person's name or email share `person:<id>`. Unknown names have their own name bucket. A successful password or passkey sign-in gives the browser a sealed, HttpOnly, SameSite=Strict device cookie, valid for 30 days or until the broker restarts. That browser uses its own five-failure budget instead of the account's, so strangers cannot lock it out, and one browser cannot exhaust another's budget. The cookie is no authority by itself: the right password is still required. A signed-in browser's password check has a separate budget tied to its session. Each budget has at most one check in flight (another try meanwhile is a 429), so every failure counts before that budget's next try and parallel guesses can't outrun it. scrypt runs off the event loop: strangers' checks share two workers with at most 32 running or queued, and any more are refused (429 `busy`) before any scrypt runs; a browser with a valid device cookie, and a signed-in session's check, run on a worker of their own, so a flood under made-up names doesn't hold them up. A password changed while it was being checked doesn't sign in. A success clears the budget it used.
 - **Passkeys** are as in §31.4, per person: `/api/passkeys/begin` registers with the signed-in person's handle and excludes only their passkeys; `/api/passkey/finish` signs in whoever's passkey it is (a person's passkey clears a pending one-time password: it proves it's them).
 - **The fresh check** (§31.4) is a passkey **or** a password: `POST /api/signin/check {password}` for a signed-in browser. The app's **Confirm it's you** dialog asks for the password (with **Use a passkey** beside it when there is one); someone with no password gets their passkey at once. It guards adding a passkey, changing a password, adding someone, a new one-time password, and pairing or approving a machine.
 - **Sign out everywhere** ends that person's sessions only; `switchboard logout --all` from the container's shell still ends everyone's.
@@ -3101,3 +3117,38 @@ Private rooms (#74) aren't built yet; when they are, an invitation into one also
 
 ### 43.6 Tests
 `test_invites.py` (unit: pending, the texts, parsing, the roles); `test_invite_flow.py` (integration: the message reaching the agent alone in its room, the notice and the pending row, the agent joining by itself and the row going, a cancel and its message, the same name in two rooms, a name already here, no such agent, an agent's literal `/invite`); e2e (the dialog by room, the pending row, the join clearing it, Cancel on a phone).
+
+## 44. Private rooms (#74)
+
+### 44.1 What it is
+On a hosted broker with people (§32) every room was open to everyone signed in. A **private** room is seen only by its people, like a Slack private channel: a side project, a customer's work, two people and their agents. A room is private from its creation, by the **Private** box in New room (`POST /api/rooms` with `private: true`), and stays so: there's no switching either way, so no history ever changes audience. A desktop broker has one person, so it refuses `private` ("private rooms are for a hosted broker, with people").
+
+### 44.2 Who sees what
+- **Storage (schema 15):** `rooms.private` (0 or 1; every room that existed stays 0) and `room_people(room_id, person_id, added_by, added_at)`, a person keyed as `preferences` keys them (0: the owner). The creator is the first person, in the same transaction, so a private room is never made with nobody in it. The v14→v15 migration only adds the column and the table, after the usual checked backup (§27.6).
+- **The gate:** `RoomService.visible(room, viewer)`: a public room for everyone signed in, a private one for its people. `room_for(name, viewer)` raises "no such room: #x", the words for a room that doesn't exist, so a private room's name isn't confirmed either; a closed private room's "reopen it" hint is held back the same way. Every route that takes a room calls it first (`web.py`'s `viewer()`, -1 when there's no live person, so it fails closed to the public rooms): the messages, the members and a member's detail, the review board and its moves, say, command, rules, wake settings, the room's people and reopening a closed room. `GET /api/rooms` and the closed-rooms list show only what the viewer sees.
+- **The WebSocket:** a page's subscriber carries its person; `_ws_hello` never subscribes it to a private room it isn't in, and replays nothing of one. The `rooms` frame every page gets names only public rooms (each page reads its own list back). When a person leaves, `Hub.unsubscribe_person` drops the room from their pages at once.
+- **People:** any of a private room's people adds another or removes one (`POST /api/rooms/{slug}/people`, `{action, name}`), and anyone may leave; the last person can't (close the room instead). Each is a notice in the room and a `room_people` event.
+- **The local CLI** and the broker itself see every room: they are the machine's owner, who holds the database anyway.
+
+### 44.3 Agents
+- **An agent's person** (`RoomService.host_person`): the person who made the pairing code of the machine it runs on (`link_machines.person_id`, #178); an agent on the broker's own machine or an SSH remote is the owner's.
+- **The machine's welcome** (§28.8), which names the open rooms to a remote link with `"*"`, names a private room only to a machine whose person is in it.
+- **Joining:** `AgentService.join` takes a private room only for an agent whose person is in it, and tells any other "no such room #x: ask your user to create it", as for a room that isn't there.
+- **Leaving:** when a person leaves or is removed from a private room, their agents' memberships there end (`person_left`, a leave line "left: its person is no longer in the room"). Removing someone from switchboard (`person_gone`) takes them out of every private room, with their agents.
+- **Who they answer to:** an agent's join text, `who()` and @mentions name the room's people (`room_humans`), not everyone on the broker.
+
+### 44.4 The admin
+`GET /api/private-rooms` (the admin section) lists every private room's name, people and creator, and **Admin > People** shows them, never what's in them. The admin can always read the database, so the page doesn't pretend otherwise: privacy is from other people, not from whoever runs the server. A private room the admin isn't in is closed or deleted from the CLI (§28).
+
+### 44.5 Not in it, and the choices made
+- No switching a room between public and private (a history would change audience).
+- Agents on the broker's own machine are the admin's, not chosen at join.
+- `/catchup` stays inside its room (its subjects are members); an invitation (#117) into a private room is for later: whichever of the two lands second adds that check.
+- Private rooms count against nothing new: the wake budget is per room already.
+- A direct message is a small private room.
+
+### 44.6 Threat model delta
+New: a person's view of the rooms is narrower. Unchanged: an agent in a private room and a public one can repeat what it read (SECURITY.md); the admin, the CLI and the database see everything. Every route that takes a room goes through `room_for`, so a new route that forgets it shows a private room to everyone: the integration tests list each route.
+
+### 44.7 Tests
+`test_private_rooms.py` (a non-member refused by every REST route with the words of a missing room; the WebSocket hello and the `rooms` frame; an agent of a non-member refused, then joining once its person is added, and leaving with them; adding and removing people, the last one kept; the admin's list and a removed person leaving; a desktop broker; existing rooms public; a machine's welcome naming only its person's private rooms); `test_db_migrate_v15.py` (the migration, and the store's people); `test_private_rooms_ui.py` (e2e: the Private box, the lock, the people with Add and Leave, the admin's card, a phone).

@@ -368,8 +368,8 @@ class AgentService:
             self._detach_codex(conn, mc)
         acts: list[Action] = self.engine.close_conn_sinks(conn.id)
         for p in self.store.participants_by_mcp(mc.ident.host, mc.ident.mcp_pid, mc.ident.mcp_start):
-            if p.harness == "codex" and p.host == LOCAL_HOST:
-                continue  # CodexLink tracks a local thread; a remote one has only this connection
+            if self.engine.adapter(p).keep_on_mcp_disconnect(p):
+                continue
             acts += self.engine.expire_pull_batches(p.id, "disconnect")
             acts += self.engine.set_status(p, "offline", "mcp:bye")
         self.run(acts)
@@ -503,13 +503,12 @@ class AgentService:
         h, host = mc.harness, mc.ident.host
         if h == "test":
             return session_key("test", host, str(mc.test_session))
-        if h == "codex":
-            if not thread_id:
-                raise ServiceError("bad_request", "Codex calls must carry _meta.threadId")
-            return session_key("codex", host, thread_id)
-        # every other harness's own rule (claude, devin and an unknown harness share the
-        # base default; Cursor's is pending until its join nonce binds a conversation, §6.3)
-        return self.engine.adapter_for(h, host).session_key(mc.ident, thread_id)
+        # Each harness's rule: Codex keys by thread, Cursor starts pending, and
+        # claude, devin and unknown use the base process key (§6.3).
+        try:
+            return self.engine.adapter_for(h, host).session_key(mc.ident, thread_id)
+        except ValueError as e:
+            raise ServiceError("bad_request", str(e)) from e
 
     @staticmethod
     def _same_mcp(p: Participant, ident: McpIdentity) -> bool:
@@ -596,10 +595,9 @@ class AgentService:
             # (host, mcp_pid, mcp_start): a credential works only from the MCP process that joined,
             # on its own host (§27.5.4)
             raise ServiceError("unauthorized", "this credential belongs to another process")
-        if p.harness == "codex":
-            tid = params.get("thread_id")
-            if not isinstance(tid, str) or p.session_key != session_key("codex", p.host, tid):
-                raise ServiceError("unauthorized", "this credential belongs to another Codex thread")
+        credential_error = self.engine.adapter(p).credential_error(p, params)
+        if credential_error is not None:
+            raise ServiceError("unauthorized", credential_error)
         room = self.store.room_by_id(m.room_id)
         assert room is not None
         if _remote(conn):
@@ -639,13 +637,16 @@ class AgentService:
                     f"members on {host} may join only {allowed}"
                     " (the rooms of its remotes.toml entry on the desktop)",
                 )
+        # whose agent this is (§44.3): a private room takes only its own people's agents, and
+        # says "no such room" to any other, as it does to the people who aren't in it
+        person = self.svc.host_person(host)
         try:
             room = self.svc.room(raw_room)
         except ServiceError as e:
             if e.code == "not_found":
                 n = raw_room.strip().lower()
                 n = n if n.startswith("#") else "#" + n
-                if self.store.closed_rooms(n):
+                if any(self.svc.visible(r, person) for r in self.store.closed_rooms(n)):
                     raise ServiceError(
                         "not_found", f"{n} was closed by {self.cfg.human_name}: ask your user to reopen it"
                     ) from None
@@ -653,6 +654,10 @@ class AgentService:
                     "not_found", f"no such room {clean(n)[:40]}: ask your user to create it"
                 ) from None
             raise
+        if not self.svc.visible(room, person):
+            raise ServiceError(
+                "not_found", f"no such room {clean(room.name)[:40]}: ask your user to create it"
+            )
         name = params.get("screen_name")
         name = name.strip().lower().lstrip("@") if isinstance(name, str) else ""
         if not SCREEN_NAME_RE.match(name):
@@ -673,9 +678,9 @@ class AgentService:
         key = self._session_key(mc, tid)
         h = mc.harness
         adapter = self.engine.adapter_for(h, host)
-        if h == "codex" and tid and self._held_elsewhere("codex", tid, host) is not None:
-            # a thread id is global: no session ever moves between hosts (§27.5.4)
-            raise ServiceError("conflict", "this thread is joined from another machine")
+        conflict = adapter.join_conflict(self.store, tid, host)
+        if conflict is not None:
+            raise ServiceError("conflict", conflict)
         existing = self.store.find_participant(h, key)
         mine = adapter.existing_session(self.store, mc.ident)
         if mine is not None:
@@ -707,10 +712,7 @@ class AgentService:
         elif existing is None or existing.status == "offline":
             fields.update(status="starting", status_at=now, status_src="join")
         same_mcp = existing is not None and self._same_mcp(existing, mc.ident)
-        if h == "codex" and not same_mcp:
-            # a Codex thread proof belongs to the MCP process that proved it (§9.3):
-            # a join from anywhere else proves the thread again
-            fields["thread_proof"] = 0
+        fields.update(adapter.rebind_fields(existing, same_mcp=same_mcp))
         fields.update(adapter.join_fields(existing))
         cur = self.store.active_membership(room.id, existing.id) if existing else None
         if cur is None and link is not None:
@@ -761,13 +763,9 @@ class AgentService:
             self.store.add_event(
                 "bind", room_id=room.id, membership_id=m.id, participant_id=p.id, data={"what": "rotate"}
             )
-            if h == "codex" and not same_mcp:
-                # another MCP process took this thread's membership over (the one that held
-                # it is gone, e.g. after a daemon restart): as visible as a new join; its
-                # thread is proven again before any push (§9.3)
-                self.run(
-                    [Notice(room.id, "info", f"{m.screen_name} re-joined from a new switchboard MCP server")]
-                )
+            notice = adapter.rejoin_notice(p, m.screen_name, same_mcp=same_mcp)
+            if notice is not None:
+                self.run([Notice(room.id, "info", notice)])
         else:
             m = self.store.create_membership(room.id, p.id, name, cred_hash(cred))
             # a Codex thread proof about to run shows as "verifying...", not "mcp-only"; the
@@ -812,7 +810,7 @@ class AgentService:
             guidance=adapter.join_guidance(p, room.name),
             test_mode=self.state.test_mode,
             rejoined=rejoined,
-            people=self.svc.people_names(),
+            people=self.svc.room_humans(room),
             room_rules=room.rules_text,
         )
         self.store.mark_rules_seen(m.id, room.rules_version)
@@ -853,7 +851,7 @@ class AgentService:
     def who(self, conn: "Conn", params: dict[str, Any]) -> dict[str, Any]:
         _p, _m, room = self._member(conn, params)
         rows = self.svc.member_rows(room.id)
-        humans = self.svc.people_names()
+        humans = self.svc.room_humans(room)
         who = (
             f"{envelope._word(humans[0])} (your user, kind=human)"
             if len(humans) == 1
@@ -1117,8 +1115,7 @@ class AgentService:
         return conn.host, chain, argv_fn
 
     def _held_elsewhere(self, harness: str, rest: str, host: str) -> Participant | None:
-        """An active session of ``harness`` with this global id (a Codex thread, a Cursor
-        conversation) on another host than ``host``, this machine included (§27.5.4)."""
+        """An active Cursor conversation on another host, this machine included (§27.5.4)."""
         for p in self.store.active_participants():
             if p.harness != harness or p.host == host:
                 continue

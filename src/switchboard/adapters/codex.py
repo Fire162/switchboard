@@ -110,7 +110,7 @@ from switchboard.adapters.codex_rpc import (
     turn_steer_params,
 )
 from switchboard.broker import proc
-from switchboard.broker.peer import match_agent
+from switchboard.broker.peer import McpIdentity, match_agent
 from switchboard.clock import Clock, SystemClock
 from switchboard.config import Config
 from switchboard.models import (
@@ -523,10 +523,58 @@ class Orphan:
     agent_start: float | None
 
 
+# ------------------------------------------------------------- membership
+class CodexMembership:
+    """Thread identity and binding shared by local and remote Codex adapters (§6.3, §27.7)."""
+
+    def session_key(self, ident: McpIdentity, thread_id: str | None) -> str:
+        if not thread_id:
+            raise ValueError("Codex calls must carry _meta.threadId")
+        return session_key("codex", ident.host, thread_id)
+
+    def join_conflict(self, store: Any, thread_id: str | None, host: str) -> str | None:
+        if thread_id is None:
+            return None  # session_key() reports the missing thread id first
+        for p in store.active_participants():
+            if p.harness != "codex" or p.host == host:
+                continue
+            parts = split_session_key(p.session_key)
+            if parts is not None and parts[2] == thread_id:
+                return "this thread is joined from another machine"
+        return None
+
+    def rebind_fields(self, existing: Participant | None, *, same_mcp: bool) -> dict[str, Any]:
+        # Proof belongs to the MCP process that made it, not to the thread id alone.
+        return {} if same_mcp else {"thread_proof": 0}
+
+    def credential_error(self, p: Participant, params: dict[str, Any]) -> str | None:
+        thread_id = params.get("thread_id")
+        if not isinstance(thread_id, str) or p.session_key != session_key("codex", p.host, thread_id):
+            return "this credential belongs to another Codex thread"
+        return None
+
+    def keep_on_mcp_disconnect(self, p: Participant) -> bool:
+        return p.host == LOCAL_HOST  # CodexLink still tracks this local thread
+
+    def rejoin_notice(self, p: Participant, name: str, *, same_mcp: bool) -> str | None:
+        if not same_mcp:
+            return f"{name} re-joined from a new switchboard MCP server"
+        return None
+
+
 # ------------------------------------------------------------------ adapter
-class CodexAdapter(Adapter):
+def steered(p: Participant, ev: HookEvent, was_idle: bool) -> bool:
+    """Input steered into a running turn (a turn/steer, or a turn/start merged into a busy
+    turn) fires UserPromptSubmit with that turn's own id: mid-turn input, not a new turn
+    (M4 live)."""
+    return ev.ev == "UserPromptSubmit" and bool(ev.gen) and (ev.gen or "")[:128] == p.gen and not was_idle
+
+
+class CodexAdapter(CodexMembership, Adapter):
     harness = "codex"
+    local_only = True  # the push paths all talk to this machine's app-server
     serial_push = True  # one turn/start, steer or queue item in flight per thread
+    reports_approval_mode = True  # the session id is the thread, proven on its own (§9.3)
 
     def __init__(self, cfg: Config):
         super().__init__(cfg)
@@ -911,6 +959,9 @@ class CodexAdapter(Adapter):
                 return Route("defer", reason="codex queue failed; retrying")
             return Route("push", path="queue")
         return Route("none", reason=note or "idle and not listening: call wait() or poke it")
+
+    def is_mid_turn(self, p: Participant, ev: HookEvent, was_idle: bool) -> bool:
+        return steered(p, ev, was_idle)
 
     def on_hook(self, p: Participant, ev: HookEvent) -> dict[str, Any] | None:
         tid = thread_of(p)

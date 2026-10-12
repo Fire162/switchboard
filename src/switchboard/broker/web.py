@@ -100,6 +100,9 @@ BAD_TOKEN_EVENT_S = 60.0
 SETUP_COOKIE = "switchboard_setup"
 PASSKEY_COOKIE = "switchboard_passkey"
 ADD_COOKIE = "switchboard_passkey_add"
+DEVICE_COOKIE = "switchboard_device"
+DEVICE_TTL_S = 30 * 24 * 3600
+OPEN_CHECKS_MAX = 32  # strangers' password checks running or queued; past this, refused before scrypt
 HASH_RE = re.compile(r"[0-9a-f]{64}")  # a remote's config_hash (sha256 hex)
 ROOM_ID_RE = re.compile(r"[1-9][0-9]{0,18}")  # a room id in /api/closed-rooms/{rid}/reopen
 MAX_ROOM_ID = 2**63 - 1  # SQLite's INTEGER: 19 digits can be more (OverflowError, not 400)
@@ -176,6 +179,55 @@ async def _json_body(request: Request) -> dict[str, Any]:
 
 
 def install(app: FastAPI, state: "BrokerState") -> None:
+    # scrypt work (#182). Strangers share two workers and a bounded queue: a flood past it is
+    # refused before any scrypt runs, so it can't grow without end. A browser the broker already
+    # trusts (its device cookie, or a session's own check) has a worker of its own, so a flood
+    # under made-up names doesn't hold it up. One check at a time per guessing budget: every
+    # failure is counted before that budget's next try, so parallel guesses can't outrun it.
+    open_work, trusted_work = asyncio.Semaphore(2), asyncio.Semaphore(1)
+    open_checks = [0]
+    checking: set[str] = set()
+
+    def refuse_check(budget: str, trusted: bool) -> Response | None:
+        """A 429 when this budget has a check in flight, or strangers' checks are full."""
+        if budget in checking:
+            return _err(429, "slow_down", "this sign-in is being checked: try again in a moment")
+        if not trusted and open_checks[0] >= OPEN_CHECKS_MAX:
+            return _err(429, "busy", "too many sign-ins right now: try again in a few seconds")
+        return None
+
+    async def check_password(typed: Any, stored: str | None, budget: str, trusted: bool) -> bool:
+        """One scrypt check, the dummy hash when there's no real one (#179). The caller has
+        ``refuse_check``ed and records the outcome before its next ``await``."""
+        checking.add(budget)
+        open_checks[0] += 0 if trusted else 1
+        try:
+            async with trusted_work if trusted else open_work:
+                matched = await asyncio.to_thread(verify_password, typed, stored or DUMMY_HASH)
+        finally:
+            checking.discard(budget)
+            open_checks[0] -= 0 if trusted else 1
+        return stored is not None and matched
+
+    def device_id(request: Request, account: str) -> str | None:
+        sealed = state.sealer.unseal(request.cookies.get(DEVICE_COOKIE))
+        if sealed is None or sealed.get("kind") != "signin_device" or sealed.get("account") != account:
+            return None
+        value = sealed.get("id")
+        return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{22}", value) else None
+
+    def trust_device(resp: Response, account: str, current: str | None = None) -> None:
+        value = current or secrets.token_urlsafe(16)
+        resp.set_cookie(
+            DEVICE_COOKIE,
+            state.sealer.seal({"kind": "signin_device", "account": account, "id": value}, DEVICE_TTL_S),
+            max_age=DEVICE_TTL_S,
+            path="/",
+            httponly=True,
+            samesite="strict",
+            secure=secure(),
+        )
+
     def who(request: Request) -> people.Who | None:
         """Whoever this request's session is, if it's a live one (a removed person's is not),
         even one that must choose its own password first."""
@@ -186,6 +238,12 @@ def install(app: FastAPI, state: "BrokerState") -> None:
         still on a one-time password."""
         w = who(request)
         return w.h if w is not None and not w.must_reset else None
+
+    def viewer(request: Request) -> int:
+        """Who's asking, for private rooms (§44): their person id, 0 for the owner. No live
+        person is -1, which no private room lists: it fails closed, to the public rooms."""
+        w = who(request)
+        return state.service.person_key(w.person_id) if w is not None else -1
 
     def unauthorized() -> JSONResponse:
         if state.hosted:
@@ -463,6 +521,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
         log.warning("switchboard set up: the admin chose a password")
         resp = _ok({"ok": True, "human": state.cfg.human_name})
         _set_cookie(resp, sid, secure=secure())
+        trust_device(resp, "owner")
         _drop_cookie(resp, SETUP_COOKIE, secure=secure())
         return resp
 
@@ -586,6 +645,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             )
             state.hub.notice(None, "warn", f'new web login: {name} (passkey "{row.name}")')
             _set_cookie(resp, sid, secure=secure())
+        trust_device(resp, password_bucket(row.person_id), device_id(request, password_bucket(row.person_id)))
         _drop_cookie(resp, PASSKEY_COOKIE, secure=secure())
         return resp
 
@@ -697,10 +757,14 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             if kind != "none"
             else f"name:{name or '?'}"
         )
-        wait = state.signin.wait_s(key)
+        trusted = device_id(request, key)
+        budget = f"device:{trusted}" if trusted is not None else key
+        wait = state.signin.wait_s(budget)
         if wait > 0:
             return _err(429, "slow_down", f"too many wrong tries: wait {int(wait) + 1} s and try again")
-        now = state.clock.now()
+        refused = refuse_check(budget, trusted is not None)
+        if refused is not None:
+            return refused
         if kind == "owner":
             stored, typed = state.store.owner_password_hash(), pw
         elif kind == "person":
@@ -709,9 +773,16 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             typed = (normalize_one_time(pw) or pw) if who_p.must_reset else pw
         else:
             stored, typed = None, pw
-        password_ok = stored is not None and verify_password(typed, stored)
-        if stored is None:
-            verify_password(typed, DUMMY_HASH)  # as long as a real check either way: see above
+        password_ok = await check_password(typed, stored, budget, trusted is not None)
+        # nothing below awaits until the outcome is recorded (``check_password``); a password
+        # changed while this one was checked doesn't count
+        if kind == "owner":
+            password_ok = password_ok and state.store.owner_password_hash() == stored
+        elif kind == "person":
+            assert who_p is not None
+            current = state.store.person(who_p.id)
+            password_ok = password_ok and current is not None and current.password_hash == stored
+        now = state.clock.now()
         resp: JSONResponse | None = None
         if kind == "owner":
             if state.claim is not None and state.claim.active and state.claim.check(pw):
@@ -719,7 +790,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
                     return _err(
                         409, "busy", "Someone is setting up this switchboard from another browser right now."
                     )
-                state.signin.ok(key)
+                state.signin.ok(budget)
                 return start_claim(
                     _ok(
                         {
@@ -738,7 +809,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             if person.must_reset:
                 if password_ok:
                     if person.password_expires_at is not None and now >= person.password_expires_at:
-                        state.signin.failed(key)
+                        state.signin.failed(budget)
                         return _err(
                             403, "expired", "this one-time password has expired: ask the admin for a new one"
                         )
@@ -746,10 +817,11 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             elif password_ok:
                 resp = signed_in(person.id, person.name, "password", now)
         if resp is None:
-            state.signin.failed(key)
+            state.signin.failed(budget)
             failed("bad_password")
             return _err(403, "bad_password", "wrong email or password")
-        state.signin.ok(key)
+        state.signin.ok(budget)
+        trust_device(resp, key, trusted)
         return resp
 
     def signed_in(
@@ -781,16 +853,19 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             body = await _json_body(request)
         except ServiceError as e:
             return _svc_err(e)
-        key = password_bucket(w.person_id)
+        key = f"check:{w.h}"
         wait = state.signin.wait_s(key)
         if wait > 0:
             return _err(429, "slow_down", f"too many wrong tries: wait {int(wait) + 1} s and try again")
+        refused = refuse_check(key, True)
+        if refused is not None:
+            return refused
         stored = (
             state.store.owner_password_hash()
             if w.person_id is None
             else getattr(state.store.person(w.person_id), "password_hash", None)
         )
-        if not verify_password(body.get("password"), stored):
+        if not await check_password(body.get("password"), stored, key, True):
             state.signin.failed(key)
             failed("bad_password")
             return _err(403, "bad_password", "wrong password")
@@ -985,6 +1060,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             return _err(404, "not_found", "no such person")
         theirs = state.store.machines_of(p.id)  # paired or approved by them: they go too (#178)
         gone = state.store.person_remove(p.id) or []
+        state.service.person_gone(p.id)  # out of every private room, with their agents (§44.3)
         for g in gone:
             state.hub.close_sessions(g)
         removed = []
@@ -1375,7 +1451,12 @@ def install(app: FastAPI, state: "BrokerState") -> None:
     async def list_rooms(request: Request) -> Response:
         if session(request) is None:
             return unauthorized()
-        return _ok({"rooms": state.service.rooms(), "closed": state.store.count_closed_rooms()})
+        return _ok(
+            {
+                "rooms": state.service.rooms(viewer(request)),
+                "closed": len(state.service.closed_room_dicts(viewer(request))),
+            }
+        )
 
     @app.post("/api/rooms")
     async def create_room(request: Request) -> Response:
@@ -1387,7 +1468,13 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             name = body.get("name")
             if not isinstance(name, str):
                 raise ServiceError("bad_request", "name is required")
-            room = state.service.create_room(name, creator=w.name, person_id=w.person_id)
+            private = body.get("private", False)
+            if not isinstance(private, bool):
+                raise ServiceError("bad_request", "private must be true or false")
+            if private and not state.hosted:
+                # one person: a private room would be every room (§44.1)
+                raise ServiceError("bad_request", "private rooms are for a hosted broker, with people")
+            room = state.service.create_room(name, creator=w.name, person_id=w.person_id, private=private)
             return _ok({"room": state.service.room_dict(room)})
         except ServiceError as e:
             return _svc_err(e)
@@ -1401,6 +1488,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             body = await _json_body(request)
             if set(body) != {"text"}:
                 raise ServiceError("bad_request", "text is required")
+            state.service.room_for(slug, viewer(request))
             room = state.service.set_room_rules(slug, body["text"], w.name)
             return _ok({"rules": room.rules_text})
         except ServiceError as e:
@@ -1424,6 +1512,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
                 )
             if isinstance(hops, bool) or not isinstance(hops, int) or not 0 <= hops <= MAX_HOPS:
                 raise ServiceError("bad_request", f"hop_limit must be an integer from 0 to {MAX_HOPS}")
+            state.service.room_for(slug, viewer(request))
             room = state.service.set_room_wake(slug, budget_per_hour=budget, hop_limit=hops, actor=w.name)
             return _ok({"settings": state.service.settings(room)})
         except ServiceError as e:
@@ -1436,7 +1525,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
         if session(request) is None:
             return unauthorized()
         try:
-            room = state.service.room(slug)
+            room = state.service.room_for(slug, viewer(request))
             return _ok({"board": state.boards.board(room)})
         except ServiceError as e:
             return _svc_err(e)
@@ -1450,7 +1539,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             body = await _json_body(request)
             if set(body) - {"action", "item", "option", "owner", "reason"}:
                 raise ServiceError("bad_request", "unknown fields")
-            room = state.service.room(slug)
+            room = state.service.room_for(slug, viewer(request))
             try:
                 return _ok(state.boards.person(room, w.name, w.person_id, body))
             except ReviewError as e:
@@ -1465,6 +1554,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
         try:
             after = _qint(request, "after")
             limit = _qint(request, "limit") or 200
+            state.service.room_for(slug, viewer(request))
             return _ok({"messages": state.service.history(slug, after, min(limit, 1000))})
         except ServiceError as e:
             return _svc_err(e)
@@ -1490,7 +1580,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
         if session(request) is None:
             return unauthorized()
         try:
-            room = state.service.room(slug)
+            room = state.service.room_for(slug, viewer(request))
             w = who(request)
             return _ok(
                 {
@@ -1513,6 +1603,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
         if session(request) is None:
             return unauthorized()
         try:
+            state.service.room_for(slug, viewer(request))
             return _ok(state.service.member_detail(slug, name))
         except ServiceError as e:
             return _svc_err(e)
@@ -1527,6 +1618,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             text = body.get("text")
             if not isinstance(text, str):
                 raise ServiceError("bad_request", "text is required")
+            state.service.room_for(slug, viewer(request))
             msg = state.service.human_say(
                 slug, text, via="web", person=(w.name, w.person_id), reply_to=body.get("reply_to")
             )
@@ -1544,6 +1636,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             text = body.get("text")
             if not isinstance(text, str):
                 raise ServiceError("bad_request", "text is required")
+            state.service.room_for(slug, viewer(request))
             res = state.service.command(
                 slug, text, Actor(role="human", via="web", name=w.name, person_id=w.person_id)
             )
@@ -1551,13 +1644,47 @@ def install(app: FastAPI, state: "BrokerState") -> None:
         except ServiceError as e:
             return _svc_err(e)
 
+    # A private room's people (§44.2): any of them adds or removes one, and anyone may leave.
+    @app.post("/api/rooms/{slug}/people")
+    async def room_people(request: Request, slug: str) -> Response:
+        w = who(request)
+        if w is None or w.must_reset:
+            return unauthorized()
+        try:
+            body = await _json_body(request)
+            action, name = body.get("action"), body.get("name")
+            if (
+                set(body) != {"action", "name"}
+                or action not in ("add", "remove")
+                or not isinstance(name, str)
+            ):
+                raise ServiceError("bad_request", 'action ("add" or "remove") and name are required')
+            me = viewer(request)
+            room = state.service.room_for(slug, me)
+            if action == "add":
+                text = state.service.add_room_person(room, name[:64], me)
+            else:
+                text = state.service.remove_room_person(room, name[:64], me)
+            fresh = state.store.room_by_id(room.id)
+            return _ok({"text": text, "room": state.service.room_dict(fresh) if fresh else None})
+        except ServiceError as e:
+            return _svc_err(e)
+
+    # The admin sees every private room's name and people, never its contents (§44.4).
+    @app.get("/api/private-rooms")
+    async def private_rooms(request: Request) -> Response:
+        _w, no = admin(request, False)
+        if no is not None:
+            return no
+        return _ok({"rooms": state.service.private_rooms()})
+
     # ------------------------------------------------------- closed rooms
     # Not under /api/rooms/{slug}: a room named #closed must not clash (§28).
     @app.get("/api/closed-rooms")
     async def closed_rooms(request: Request) -> Response:
         if session(request) is None:
             return unauthorized()
-        return _ok({"rooms": state.service.closed_room_dicts()})
+        return _ok({"rooms": state.service.closed_room_dicts(viewer(request))})
 
     @app.post("/api/closed-rooms/{rid}/reopen")
     async def reopen_room(request: Request, rid: str) -> Response:
@@ -1567,6 +1694,9 @@ def install(app: FastAPI, state: "BrokerState") -> None:
             await _json_body(request)
             if not ROOM_ID_RE.fullmatch(rid) or int(rid) > MAX_ROOM_ID:
                 raise ServiceError("bad_request", "bad room id")
+            closed = state.store.room_by_id(int(rid))
+            if closed is not None and not state.service.visible(closed, viewer(request)):
+                raise ServiceError("not_found", "no such closed room")
             room = state.service.reopen_room(int(rid), via="web")
             return _ok({"room": state.service.room_dict(room)})
         except ServiceError as e:
@@ -1631,6 +1761,7 @@ def install(app: FastAPI, state: "BrokerState") -> None:
         await ws.accept()
         sub = WsSubscriber()
         sub.sid_hash = sid_hash
+        sub.person = 0 if w.person_id is None else w.person_id  # whose page, for private rooms (§44)
         state.hub.add(sub)
 
         async def close(code: int) -> None:
@@ -1699,7 +1830,8 @@ def _ws_hello(state: "BrokerState", sub: WsSubscriber, frame: dict[str, Any]) ->
         except InvalidName:
             continue
         room = state.store.get_room(name)
-        if room is None:
+        # a private room the page's person isn't in is no room at all (§44): never subscribed
+        if room is None or not state.service.visible(room, sub.person if sub.person is not None else -1):
             continue
         a = after.get(raw, after.get(name))
         a = a if isinstance(a, int) and not isinstance(a, bool) and a >= 0 else None
