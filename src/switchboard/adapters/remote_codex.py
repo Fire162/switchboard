@@ -68,6 +68,7 @@ def thread_of(p: Participant) -> str:
 
 class RemoteCodexAdapter(CodexMembership, PullAdapter):
     serial_push = True  # one wake in flight per thread
+    reports_approval_mode = True  # as a Codex session here (§9.3)
 
     def __init__(self, cfg: Config):
         super().__init__("codex", cfg)
