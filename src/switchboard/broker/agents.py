@@ -60,6 +60,7 @@ from switchboard.models import (
     Participant,
     Room,
     Snapshot,
+    behind_by_minor,
     canonical_event,
     normalize_room,
     session_key,
@@ -133,12 +134,12 @@ def tools_claim(value: Any) -> tuple[str, ...] | None:
     that isn't one is dropped; at most ``MAX_TOOLS`` are read."""
     if not isinstance(value, list):
         return None
-    return tuple(sorted({v for v in value[:MAX_TOOLS] if isinstance(v, str) and TOOL_NAME_RE.match(v)}))
+    return tuple(sorted({v for v in value[:MAX_TOOLS] if isinstance(v, str) and TOOL_NAME_RE.fullmatch(v)}))
 
 
 def version_claim(value: Any) -> str | None:
     """The switchboard version an MCP server says it runs, or None: only to name it to a person."""
-    return value if isinstance(value, str) and VERSION_RE.match(value) else None
+    return value if isinstance(value, str) and VERSION_RE.fullmatch(value) else None
 
 
 # a rate-limited say() waits its turn (§8.4); a burst past this many per member is refused
@@ -251,6 +252,14 @@ class AgentService:
         if claim is None:
             return None
         return reviews.board_reason(member.name, claim[1], claim[2])
+
+    def member_claims(self, member: Member) -> tuple[str | None, tuple[str, ...] | None]:
+        """The current MCP process's bounded claims, or unknown after it disconnects."""
+        p = self.store.get_participant(member.participant_id)
+        if p is None or p.mcp_pid is None or p.mcp_start is None:
+            return None, None
+        claim = self._mcp_claims.get(_mcp_key(p.host, p.mcp_pid, p.mcp_start))
+        return (claim[1], claim[2]) if claim is not None else (None, None)
 
     # ================================================================= mcp
     def hello(self, conn: "Conn", params: dict[str, Any]) -> dict[str, Any]:
@@ -858,6 +867,17 @@ class AgentService:
                 text=f"joined ({where}, {shown})" + (", back after a restart" if resumed is not None else ""),
                 sender_host=host or None,
             )
+            if behind_by_minor(mc.version):
+                self.run(
+                    [
+                        Notice(
+                            room.id,
+                            "info",
+                            f"{name} reports switchboard {mc.version}; run switchboard update"
+                            " where it runs, then restart its session.",
+                        )
+                    ]
+                )
         self.refresh_index()
         if p.agent_pid:
             early = self._early_models.get((p.host, p.agent_pid, start_key(p.agent_start)))
@@ -935,6 +955,8 @@ class AgentService:
             if x.host:
                 bits.append(f"host={envelope._word(x.host)}")
             bits += [f"status={x.status}", f"tier={x.tier or '-'}"]
+            bits.append(f"version_claim={x.version_claim or 'unknown'}")
+            bits.append(f"tools_claim={','.join(x.tools_claim) if x.tools_claim is not None else 'unknown'}")
             if x.tier_note:
                 bits.append(f"tier_note={envelope._word(x.tier_note)}")
             mode = {"bypass": "approvals_off", "prompting": "prompting"}.get(x.approval_mode, "unknown")
