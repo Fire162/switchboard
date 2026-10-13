@@ -3,9 +3,9 @@
 It does what docs/INSTALL.md's "To upgrade" says, in order:
 
 1. **Upgrade this copy** the way it was installed: a uv tool (``uv tool install
-   switchboard-chat@latest``, or ``==<version>`` with ``--version``) or pipx (``pipx install --force
-   switchboard-chat``). Anything else (a checkout, the container image, a plain venv) is refused
-   with what to do instead: switchboard can't upgrade what it didn't install.
+   --refresh-package switchboard-chat switchboard-chat@latest``, or ``==<version>`` with ``--version``)
+   or pipx (``pipx install --force switchboard-chat``). Anything else (a checkout, the container image,
+   a plain venv) is refused with what to do instead: switchboard can't upgrade what it didn't install.
 2. **Restart the dialer** if one runs in the home (a machine that dials a hosted broker). Nothing
    that wasn't running is started, so ``update`` never brings an old desktop broker back on a
    machine that now dials a hosted one; a running local broker is left to the person, who knows
@@ -82,7 +82,7 @@ def install_argv(inst: Installer, version: str | None, tool: str) -> list[str]:
         )
     spec = f"{DIST}=={version}" if version else (f"{DIST}@latest" if inst.kind == "uv" else DIST)
     if inst.kind == "uv":
-        return [tool, "tool", "install", spec]
+        return [tool, "tool", "install", "--refresh-package", DIST, spec]
     return [tool, "install", "--force", spec]
 
 
