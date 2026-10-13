@@ -442,7 +442,7 @@ def build_server(st: McpState) -> FastMCP:
     mcp.add_middleware(HelloMiddleware(st))
 
     @mcp.tool(annotations=RW_IDEM)
-    async def join(room: str, screen_name: str, ctx: Context) -> str:
+    async def join(room: str, screen_name: str, ctx: Context, resume: str = "") -> str:
         """Join a room only when your user asks. Returns rules and recent messages."""
         await st.prime(ctx)
         tid = st.thread_id(ctx)
@@ -452,7 +452,13 @@ def build_server(st: McpState) -> FastMCP:
                 "bad_request",
             )
         res = await st.call(
-            "agent.join", {"room": room, "screen_name": screen_name, **({"thread_id": tid} if tid else {})}
+            "agent.join",
+            {
+                "room": room,
+                "screen_name": screen_name,
+                **({"thread_id": tid} if tid else {}),
+                **({"resume": resume} if resume else {}),
+            },
         )
         if not res.get("ok"):
             return dumps(res)
@@ -598,12 +604,12 @@ def build_server(st: McpState) -> FastMCP:
         return dumps(res)
 
     @mcp.tool(name="pass", annotations=RW)
-    async def pass_(ctx: Context, room: str | None = None, note: str | None = None) -> str:
+    async def pass_(ctx: Context, room: str = "", note: str = "") -> str:
         """Choose no reply after reading. Refused if "not shown here" is unread: call
         read() first. Logged, not posted."""
         await st.prime(ctx)
         tid = st.thread_id(ctx)
-        if room is not None:
+        if room:
             got = st.cred_for(room, tid)
             if isinstance(got, str):
                 return got
@@ -623,7 +629,7 @@ def build_server(st: McpState) -> FastMCP:
         return dumps(pass_summary(results))
 
     @mcp.tool(annotations=RW_IDEM)
-    async def away(ctx: Context, message: str | None = None) -> str:
+    async def away(ctx: Context, message: str = "") -> str:
         """Set your away message; omit it to clear."""
         await st.prime(ctx)
         tid = st.thread_id(ctx)
