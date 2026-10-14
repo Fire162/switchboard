@@ -29,7 +29,7 @@ from switchboard.models import Room, room_slug
 
 log = logging.getLogger("switchboard.db")
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 SCHEMA = r"""
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -215,6 +215,10 @@ CREATE TABLE claims(
   expires_at REAL NOT NULL,
   PRIMARY KEY(room_id, key_norm)) WITHOUT ROWID;
 CREATE INDEX claims_member ON claims(membership_id);
+CREATE TABLE pins(
+  room_id INTEGER NOT NULL REFERENCES rooms(id), message_id INTEGER NOT NULL REFERENCES messages(id),
+  pinned_by TEXT NOT NULL CHECK(length(pinned_by) <= 100), pinned_at REAL NOT NULL,
+  PRIMARY KEY(room_id, message_id));
 """
 
 TABLES = (
@@ -236,6 +240,7 @@ TABLES = (
     "review_items",
     "room_people",
     "claims",
+    "pins",
 )
 # the tables of a version-1 database (0.1.0, 0.2.0) and of a version-2 one (0.3.0 to 0.6.5):
 # the rows a migration must keep
@@ -245,6 +250,8 @@ V3_TABLES = TABLES[:12]
 V4_TABLES = TABLES[:13]
 V8_TABLES = TABLES[:14]
 V14_TABLES = TABLES[:16]  # before room_people (v15)
+V20_TABLES = TABLES[:17]  # before claims (v21)
+V21_TABLES = TABLES[:18]  # before pins (v22)
 
 # v1 -> v2 (DESIGN.md §27.6): one BEGIN IMMEDIATE, after a verified backup. The
 # columns land at the end of their tables, where the fresh schema above puts them too.
@@ -457,6 +464,16 @@ V20_TO_V21 = (
     "UPDATE meta SET value='21' WHERE key='schema_version'",
 )
 
+# v21 -> v22 (#292, DESIGN.md §48): a room's pinned decisions, at most five, by message. The
+# table is new, so every existing room starts with none.
+V21_TO_V22 = (
+    "CREATE TABLE pins("
+    " room_id INTEGER NOT NULL REFERENCES rooms(id), message_id INTEGER NOT NULL REFERENCES messages(id),"
+    " pinned_by TEXT NOT NULL CHECK(length(pinned_by) <= 100), pinned_at REAL NOT NULL,"
+    " PRIMARY KEY(room_id, message_id))",
+    "UPDATE meta SET value='22' WHERE key='schema_version'",
+)
+
 
 def _steps(frm: int) -> list[tuple[int, tuple[str, ...], tuple[str, ...]]]:
     """The migration steps from schema ``frm`` up to the current one: (to, statements,
@@ -482,6 +499,7 @@ def _steps(frm: int) -> list[tuple[int, tuple[str, ...], tuple[str, ...]]]:
         18: (19, V18_TO_V19, ()),
         19: (20, V19_TO_V20, ()),
         20: (21, V20_TO_V21, ("claims",)),
+        21: (22, V21_TO_V22, ("pins",)),
     }
     out = []
     v = frm
@@ -507,7 +525,9 @@ def tables_of(version: int) -> tuple[str, ...]:
     if version <= 14:
         return V14_TABLES
     if version <= 20:
-        return TABLES[:-1]  # claims arrived in v21
+        return V20_TABLES
+    if version <= 21:
+        return V21_TABLES
     return TABLES
 
 
