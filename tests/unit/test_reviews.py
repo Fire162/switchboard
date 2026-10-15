@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from conftest import FakeClock
 
-from switchboard import reviews
+from switchboard import db, reviews
 from switchboard.broker.reviews import Boards
 from switchboard.reviews import Item, ReviewError
+from switchboard.store import Store
 
 
 def finding(state: str = "raised", raised_by: str = "codex-1", owner: str = "", n: int = 1) -> Item:
@@ -24,6 +26,34 @@ def finding(state: str = "raised", raised_by: str = "codex-1", owner: str = "", 
 
 def question(state: str = "open") -> Item:
     return replace(finding(), kind="question", state=state, options=("before tax", "after tax"), recommend=0)
+
+
+def test_a_new_head_outdates_only_unsettled_findings(tmp_path: Path) -> None:
+    """A head move marks old work, including an unconfirmed fix, without changing its age."""
+    clock = FakeClock()
+    store = Store(db.open_db(tmp_path / "board.db"), clock)
+    room = store.create_room("#build", "alice", 60, 30)
+    board = store.open_review(room.id, "https://example.com/shop/pull/7", "aaa1111", "codex-1")
+    raised = store.add_review_item(board["id"], "finding", "raised", title="raised", raised_by="codex-1")
+    fixed = store.add_review_item(board["id"], "finding", "fixed", title="fix to check", raised_by="codex-1")
+    done = store.add_review_item(board["id"], "finding", "dropped", title="done", raised_by="codex-1")
+    asked = store.add_review_item(board["id"], "question", "open", title="question", raised_by="codex-1")
+    clock.advance(5)
+    store.move_review_item(fixed.id, "fixed", owner="claude-1", commit_sha="bbb2222", proof="test_fix")
+    fixed_before_head = store.review_item(board["id"], "finding", fixed.n)
+    assert fixed_before_head is not None
+    clock.advance(10)
+    store.move_review_head(
+        board["id"], "ccc3333", reviews.unsettled_finding_ids(store.review_items(board["id"]))
+    )
+    items = {i.id: i for i in store.review_items(board["id"])}
+    assert [items[i.id].outdated_head for i in (raised, fixed, done, asked)] == ["ccc3333", "ccc3333", "", ""]
+    assert items[fixed.id].updated_at == fixed_before_head.updated_at  # head movement is not a new fix
+    store.move_review_item(raised.id, "conceded", owner="claude-1")
+    assert store.review_item(board["id"], "finding", raised.n).outdated_head == "ccc3333"
+    store.move_review_item(raised.id, "fixed", commit_sha="ddd4444", proof="test_raised")
+    store.move_review_item(fixed.id, "fixed", confirmed_by="codex-1")
+    assert all(not store.review_item(board["id"], "finding", n).outdated_head for n in (1, 2))
 
 
 def test_the_author_side_concedes_or_contests_and_the_raiser_only_drops() -> None:
@@ -471,3 +501,95 @@ def test_a_person_s_items_and_a_move_nobody_answers_wake_no_agent() -> None:
     assert reviews.handoff(finding(), "codex-1", ("codex-1",)) is None  # alone in the room
     gone = replace(finding("fixed", owner="claude-1"), commit="def5678", confirmed_by="")
     assert reviews.handoff(gone, "claude-1", ("claude-1",)) is None  # the raiser left
+
+
+# ------------------------------------------------- outcomes that couldn't be recorded (#371)
+def test_a_conceded_finding_moves_by_a_handover_or_once_its_owner_has_left() -> None:
+    """#371: an agent that came back under a new name after a restart couldn't fix a finding
+    conceded to its old name, and nobody could move it. Its owner may hand it over; any agent
+    but its raiser may take it over once the owner has left the room; a third agent can't take
+    it while the owner is there."""
+    f = finding("conceded", raised_by="codex-1", owner="claude-1")
+    assert reviews.agent_move(f, "concede", "claude-1") == "conceded"  # the owner hands it over
+    with pytest.raises(ReviewError, match="claude-1 can hand it over, or a person can reassign it"):
+        reviews.agent_move(f, "concede", "devin-1")
+    assert reviews.agent_move(f, "concede", "claude-2", owner_here=False) == "conceded"
+    with pytest.raises(ReviewError, match="yours"):
+        reviews.agent_move(f, "concede", "codex-1", owner_here=False)  # the raiser still can't
+
+
+def test_a_fix_by_another_agent_says_how_to_take_over_when_the_owner_left() -> None:
+    f = finding("conceded", raised_by="codex-1", owner="claude-1")
+    with pytest.raises(ReviewError, match=r"claude-1's to fix$"):
+        reviews.agent_move(f, "fix", "claude-2")
+    with pytest.raises(
+        ReviewError, match=r'isn\'t in the room: take it over first with review\(action="concede"'
+    ):
+        reviews.agent_move(f, "fix", "claude-2", owner_here=False)
+
+
+def test_a_person_reassigns_a_conceded_finding_or_rules_it_fixed() -> None:
+    f = finding("conceded", raised_by="codex-1", owner="claude-1")
+    assert reviews.person_move(f, "concede") == "conceded"
+    assert reviews.person_move(f, "fix") == "fixed"
+    with pytest.raises(ReviewError, match="can't be fixed from there"):
+        reviews.person_move(finding("raised"), "fix")
+
+
+def test_a_persons_fix_reads_right_in_the_handoff() -> None:
+    """#371: a person's Mark fixed has no agent proof and may have no commit; the handoff summary
+    said "commit ; proof: ." for it. It now says whose say it was."""
+    marked = replace(finding("fixed", owner="claude-1"), confirmed_by="alice", file="a.py", lines="3")
+    plan = reviews.handoff_plan(
+        [marked], [{"data": {"item": "F1", "to": "fixed", "by": "alice", "person": True}}]
+    )
+    assert "- F1 Fixed: off by one, on alice's say" in plan["summary"], plan["summary"]
+    assert "commit " not in plan["summary"]
+
+
+def test_a_finding_is_deferred_by_its_raiser_or_a_person_and_settles() -> None:
+    """#371: findings agreed for a follow-up ticket had no outcome: fix needs a commit, and drop
+    says the raiser withdrew it. Defer settles it for this pull request, by its raiser (like a
+    drop) or a person, and the board and the handoff say where it went."""
+    f = finding("conceded", raised_by="codex-1", owner="claude-1")
+    assert reviews.agent_move(f, "defer", "codex-1") == "dropped"
+    with pytest.raises(ReviewError, match="or a person can defer it"):
+        reviews.agent_move(f, "defer", "claude-1")
+    assert reviews.person_move(f, "defer") == "dropped"
+    with pytest.raises(ReviewError):
+        reviews.person_move(finding("fixed"), "defer")
+    deferred = replace(f, state="dropped", deferred_to="SHOP-123")
+    assert reviews.settled([deferred])
+    text = reviews.render(
+        {"url": "https://example.com/shop/pull/7", "head": "", "posted_by": None}, [deferred]
+    )
+    assert "deferred to SHOP-123" in text, text
+    plan = reviews.handoff_plan([deferred], [])
+    assert "- F1 Deferred: off by one — to SHOP-123" in plan["summary"], plan["summary"]
+
+
+# ------------------------------------------- what an agent reads off the pull request (#291)
+def test_a_report_takes_only_what_it_knows_and_says_whose_it_is() -> None:
+    """#291: the board fell behind the pull request (settled while threads were open, open after
+    the merge, CI passed on from memory). An agent reports what gh or glab shows; a value the
+    board doesn't know is refused, never taken for one it does, and the line says whose claim it
+    is and how old."""
+    assert reviews.report({"state": "open", "threads": 2, "ci": "failing"}) == {
+        "pr_state": "open",
+        "pr_threads": 2,
+        "pr_ci": "failing",
+    }
+    assert reviews.report({"threads": 0}) == {"pr_threads": 0}
+    for bad in ({"state": "approved"}, {"ci": "green"}, {"threads": 1000}, {"threads": "2"}, {}):
+        with pytest.raises(ReviewError):
+            reviews.report(bad)
+    rv = {
+        "reported_by": "claude-1",
+        "reported_at": 1000.0,
+        "pr_state": "open",
+        "pr_threads": 2,
+        "pr_ci": "failing",
+    }
+    assert reviews.report_line(rv, 1000.0 + 180) == "2 open on the PR, CI failing (per claude-1, 3 min ago)"
+    assert reviews.report_line({**rv, "pr_threads": 0, "pr_ci": ""}, 1010.0).startswith("no threads open")
+    assert reviews.report_line({"reported_by": ""}, 0.0) == ""

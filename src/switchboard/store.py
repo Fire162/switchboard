@@ -12,12 +12,13 @@ import sqlite3
 from collections.abc import Callable, Iterable, Sequence
 from typing import Any
 
-from switchboard import db, reviews
+from switchboard import claims, db, reviews
 from switchboard.clock import Clock, SystemClock
 from switchboard.models import (
     LOCAL_HOST,
     MAX_BUDGET,
     MAX_HOPS,
+    MAX_PINS,
     ROOM_RE,
     WATCHDOG_DONE,
     Batch,
@@ -30,6 +31,7 @@ from switchboard.models import (
     Participant,
     PasskeyRow,
     PersonRow,
+    Pin,
     RemoteRow,
     Room,
     room_ref,
@@ -295,7 +297,9 @@ class Store:
         ),
         ("batches", f"batches WHERE membership_id IN ({_ROOM_MEMBERSHIPS})", 1),
         ("events", f"events WHERE room_id=? OR membership_id IN ({_ROOM_MEMBERSHIPS})", 2),
+        ("pins", "pins WHERE room_id=?", 1),
         ("messages", "messages WHERE room_id=?", 1),
+        ("claims", "claims WHERE room_id=?", 1),
         ("memberships", "memberships WHERE room_id=?", 1),
         ("rooms", "rooms WHERE id=?", 1),
     )
@@ -562,6 +566,40 @@ class Store:
         ).fetchone()
         return int(r[0])
 
+    # ------------------------------------------------------------ pinned decisions (#292, §48)
+    def pins(self, room_id: int) -> list[Pin]:
+        """A room's pins, in message order (the order they were said in)."""
+        rows = self.con.execute(
+            "SELECT m.*, p.pinned_by, p.pinned_at FROM pins p JOIN messages m ON m.id=p.message_id"
+            " WHERE p.room_id=? ORDER BY m.id",
+            (room_id,),
+        ).fetchall()
+        return [Pin(Message.from_row(r), r["pinned_by"], r["pinned_at"]) for r in rows]
+
+    def pin_add(self, room_id: int, message_id: int, pinned_by: str, *, limit: int = MAX_PINS) -> bool:
+        """Pin ``message_id`` in its room: False if it already was, ``Conflict`` once the room has
+        ``limit`` pins. The count and the insert are one transaction, so two pins at once can't
+        both take the last place."""
+        with db.tx(self.con):
+            if self.con.execute(
+                "SELECT 1 FROM pins WHERE room_id=? AND message_id=?", (room_id, message_id)
+            ).fetchone():
+                return False
+            n = int(self.con.execute("SELECT COUNT(*) FROM pins WHERE room_id=?", (room_id,)).fetchone()[0])
+            if n >= limit:
+                raise Conflict(f"{n} messages are pinned already")
+            self.con.execute(
+                "INSERT INTO pins(room_id, message_id, pinned_by, pinned_at) VALUES(?,?,?,?)",
+                (room_id, message_id, pinned_by[:100], self.clock.now()),
+            )
+            return True
+
+    def pin_remove(self, room_id: int, message_id: int) -> bool:
+        """False if it wasn't pinned."""
+        with db.tx(self.con):
+            cur = self.con.execute("DELETE FROM pins WHERE room_id=? AND message_id=?", (room_id, message_id))
+            return cur.rowcount == 1
+
     # ---------------------------------------------------- memberships (reads)
     def active_names(self, room_id: int) -> list[str]:
         rows = self.con.execute(
@@ -631,6 +669,44 @@ class Store:
                 return m
         return None
 
+    def claims_for_room(self, room_id: int) -> list[claims.Claim]:
+        """Active claims for the buddy list and claim policy, with their current holder."""
+        rows = self.con.execute(
+            "SELECT c.key, c.membership_id, m.screen_name, c.expires_at"
+            " FROM claims c JOIN memberships m ON m.id=c.membership_id"
+            " WHERE c.room_id=? AND c.expires_at>? AND m.left_at IS NULL ORDER BY c.key",
+            (room_id, self.clock.now()),
+        ).fetchall()
+        return [claims.Claim(r[0], r[1], r[2], r[3]) for r in rows]
+
+    def move_claim(self, room_id: int, membership_id: int, key: str, ttl: int) -> claims.Decision:
+        """Apply the pure policy in one transaction; expired or ended claims cannot block."""
+        now = self.clock.now()
+        key_norm = key.casefold()
+        with db.tx(self.con):
+            self.con.execute(
+                "DELETE FROM claims WHERE expires_at<=? OR membership_id IN"
+                " (SELECT id FROM memberships WHERE left_at IS NOT NULL)",
+                (now,),
+            )
+            decision = claims.decide(self.claims_for_room(room_id), membership_id, key, ttl, now)
+            if decision.action == "acquired":
+                self.con.execute(
+                    "INSERT INTO claims(room_id,key_norm,key,membership_id,expires_at) VALUES(?,?,?,?,?)",
+                    (room_id, key_norm, key, membership_id, decision.expires_at),
+                )
+            elif decision.action == "renewed":
+                self.con.execute(
+                    "UPDATE claims SET expires_at=? WHERE room_id=? AND key_norm=? AND membership_id=?",
+                    (decision.expires_at, room_id, key_norm, membership_id),
+                )
+            elif decision.action == "released":
+                self.con.execute(
+                    "DELETE FROM claims WHERE room_id=? AND key_norm=? AND membership_id=?",
+                    (room_id, key_norm, membership_id),
+                )
+        return decision
+
     def set_held(self, membership_id: int, held: bool) -> None:
         now = self.clock.now()
         with db.tx(self.con):
@@ -648,6 +724,7 @@ class Store:
         ``left_at IS NULL``)."""
         now = self.clock.now()
         with db.tx(self.con):
+            self.con.execute("DELETE FROM claims WHERE membership_id=?", (membership_id,))
             self.con.execute(
                 "UPDATE memberships SET left_at=?, left_reason=?,"
                 " cred_hash=CASE WHEN ? THEN cred_hash ELSE NULL END,"
@@ -1882,7 +1959,10 @@ class Store:
         "SELECT d.membership_id, d.message_id, d.prio, d.mentioned, d.state, d.batch_id,"
         " d.attempts, d.notified_at, d.redelivered, d.reminders, d.in_context_at,"
         " m.ts, m.sender_name, m.sender_kind,"
-        " m.sender_harness, m.text, m.reply_to, m.mentions, m.sender_host"
+        " m.sender_harness, m.text, m.reply_to, m.mentions, m.sender_host,"
+        # a reply to this member's own message addresses it, like an @mention (#137)
+        " COALESCE((SELECT r.sender_membership_id FROM messages r WHERE r.id=m.reply_to)"
+        "   = d.membership_id, 0) AS reply_to_me"
         " FROM deliveries d JOIN messages m ON m.id=d.message_id"
     )
 
@@ -1996,7 +2076,7 @@ class Store:
         were notified as a stub at or before ``before``, and that the watchdog
         isn't done with yet (DESIGN.md §8.5)."""
         # active members first, then their open deliveries by index: this runs every tick
-        cols = self._ITEM_SQL.split(" FROM ")[0]
+        cols = self._ITEM_SQL.rsplit(" FROM deliveries", 1)[0]
         rows = self.con.execute(
             cols + " FROM memberships mm CROSS JOIN deliveries d INDEXED BY deliveries_open"
             " ON d.membership_id=mm.id AND d.state IN ('in_context','pending')"
@@ -2333,12 +2413,31 @@ class Store:
         return dict(r)
 
     def set_review(self, review_id: int, **fields: Any) -> None:
-        allowed = {"head", "closed_at", "posted_at", "posted_by"}
+        allowed = {
+            "head",
+            "closed_at",
+            "posted_at",
+            "posted_by",
+            "pr_state",
+            "pr_threads",
+            "pr_ci",
+            "reported_by",
+            "reported_at",
+        }
         if not fields or set(fields) - allowed:
             raise ValueError(f"unknown review fields: {sorted(set(fields) - allowed)}")
         cols = ", ".join(f"{k}=?" for k in fields)
         with db.tx(self.con):
             self.con.execute(f"UPDATE reviews SET {cols} WHERE id=?", (*fields.values(), review_id))
+
+    def move_review_head(self, review_id: int, head: str, finding_ids: list[int]) -> None:
+        """Set the head and mark old unresolved findings in one transaction (#291)."""
+        with db.tx(self.con):
+            self.con.execute("UPDATE reviews SET head=? WHERE id=?", (head, review_id))
+            self.con.executemany(
+                "UPDATE review_items SET outdated_head=? WHERE id=? AND review_id=?",
+                ((head, item_id, review_id) for item_id in finding_ids),
+            )
 
     def review_events(self, room_id: int, since: float) -> list[Event]:
         """The room's ``review`` events from ``since`` (a board's opening) on, oldest first: the
@@ -2391,10 +2490,22 @@ class Store:
         return item
 
     def move_review_item(self, item_id: int, state: str, **fields: Any) -> None:
-        allowed = {"owner", "commit_sha", "proof", "confirmed_by", "reason", "answer", "answered_by"}
+        allowed = {
+            "owner",
+            "commit_sha",
+            "proof",
+            "confirmed_by",
+            "reason",
+            "answer",
+            "answered_by",
+            "deferred_to",
+        }
         if set(fields) - allowed:
             raise ValueError(f"unknown review item fields: {sorted(set(fields) - allowed)}")
+        clear_outdated = state in ("fixed", "dropped")
         cols = ", ".join(f"{k}=?" for k in ("state", "updated_at", *fields))
+        if clear_outdated:
+            cols += ", outdated_head=''"
         with db.tx(self.con):
             self.con.execute(
                 f"UPDATE review_items SET {cols} WHERE id=?",
@@ -2535,6 +2646,8 @@ def _review_item(r: sqlite3.Row) -> reviews.Item:
         commit=r["commit_sha"],
         proof=r["proof"],
         confirmed_by=r["confirmed_by"],
+        outdated_head=r["outdated_head"],
+        deferred_to=r["deferred_to"],
         reason=r["reason"],
         options=opts,
         recommend=r["recommend"],

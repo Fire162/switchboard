@@ -12,6 +12,8 @@ an in-process test-mode broker in a temp home, seeded with three rooms (``#docs`
 never-enabled remote and four scripted agents with a Markdown-rich conversation in ``#build``.
 Every test gets fresh browser contexts from the ``ui`` fixture, each signed in through its own
 one-time login link. Tests that change state (a hold, a close) undo it or use a room of their own.
+Extra agents joined for a test close with its browser contexts; parallel e2e runs divide this
+large module across three workers, while each small module stays on one worker.
 
 Every page is watched: a console error, an uncaught page error or a CSP violation (reported by
 a ``securitypolicyviolation`` listener the context injects) fails the test, listed per page.
@@ -33,6 +35,7 @@ from typing import Any
 
 import pytest
 from conftest import PHASE_REPORTS, TEST_HUMAN, sanitize_env
+from fakes.fake_link import wait_for
 from playwright.sync_api import Browser, BrowserContext, ConsoleMessage, Page, Route, WebSocketRoute, expect
 from ui_world import CI_URL, JS_SCHEME, PROFILE, UIWorld, wait_js
 
@@ -136,22 +139,26 @@ class UI:
         return ARTIFACTS / re.sub(r"[^A-Za-z0-9_.-]+", "-", test_id).strip("-")
 
     def finish(self, failed: bool, test_id: str) -> None:
-        """Stop tracing and close every context; on a failure keep a trace and screenshots."""
+        """Close this test's contexts and agents; on failure keep traces and screenshots."""
         out = self.artifacts_dir(test_id)
-        for i, ctx in enumerate(self.contexts):
-            try:
-                if failed:
-                    out.mkdir(parents=True, exist_ok=True)
-                    for j, p in enumerate(ctx.pages):
-                        try:
-                            p.screenshot(path=str(out / f"context{i}-page{j}.png"), full_page=True)
-                        except Exception as e:  # a crashed page: the trace still has its frames
-                            (out / f"context{i}-page{j}.txt").write_text(f"no screenshot: {e}\n")
-                    ctx.tracing.stop(path=str(out / f"context{i}-trace.zip"))
-                else:
-                    ctx.tracing.stop()
-            finally:
-                ctx.close()
+        try:
+            for i, ctx in enumerate(self.contexts):
+                try:
+                    if failed:
+                        out.mkdir(parents=True, exist_ok=True)
+                        for j, p in enumerate(ctx.pages):
+                            try:
+                                p.screenshot(path=str(out / f"context{i}-page{j}.png"), full_page=True)
+                            except Exception as e:  # a crashed page: the trace still has its frames
+                                (out / f"context{i}-page{j}.txt").write_text(f"no screenshot: {e}\n")
+                        ctx.tracing.stop(path=str(out / f"context{i}-trace.zip"))
+                    else:
+                        ctx.tracing.stop()
+                finally:
+                    ctx.close()
+        finally:
+            if self.world is not None:
+                self.world.close_extra_agents()
         if failed:
             print(f"\ne2e artifacts: {out}")
 
@@ -170,6 +177,33 @@ def ui(browser: Browser, world: UIWorld, request: pytest.FixtureRequest) -> Iter
 
 
 # ------------------------------------------------------------------ helpers
+def test_extra_agents_can_be_released_before_the_world_stops(browser: Browser, world: UIWorld) -> None:
+    """Close an added MCP process with its test, or each worker retains one per prior test.
+
+    The browser context and its page must end at the same boundary; the seeded world stays up.
+    """
+    room = "e2e-extra-agent-lifetime"
+    world.create_room(room)
+    world.add_agents(f"#{room}", ("scout",))
+    ui = UI(browser, world)
+    failed = True
+    try:
+        page = ui.open(room)
+        agent = world._extra_named[(f"#{room}", "scout")]
+        assert agent._stack is not None
+        assert len(ui.browser.contexts) == 1
+        assert len(ui.browser.contexts[0].pages) == 1
+        failed = False
+    finally:
+        ui.finish(failed, "e2e-extra-agent-lifetime")
+
+    assert agent._stack is None
+    assert not world._extra
+    assert not world._extra_named
+    assert not ui.browser.contexts
+    assert page.is_closed()
+
+
 def open_room(page: Page, room: str) -> None:
     """Click a room in the sidebar (opening the drawer first at phone width) and wait for its
     header (and, for #build, its seeded log and members)."""
@@ -891,6 +925,53 @@ def test_agent_status_line_ages_in_members_light_dark_and_phone(ui: UI) -> None:
         no_horizontal_scroll(page)
 
 
+def test_members_shows_each_claim_holder_and_expiry(ui: UI) -> None:
+    """The claimed outside work is visible beside its holder in light, dark and phone views."""
+    room = "e2e-claims"
+    ui.world.create_room("#" + room)
+    ui.world.add_agents("#" + room, ("claude-1", "codex-1"))
+    live = ui.open(room=room, color_scheme="light")
+    expect(live.locator("#buddy-list .m-claim-entry")).to_have_count(0)
+    wait_for(
+        lambda: ui.world.broker.on_loop(
+            lambda: any(
+                "#" + room in sub.rooms and "members" in sub.kinds and not sub.closed
+                for sub in ui.world.broker.state.hub.subs
+            )
+        ),
+        what="the browser's members subscription",
+    )
+    result = ui.world.agent_call("#" + room, "claude-1", "claim", key="build", ttl=3600)
+    assert result["ok"], result
+    pages = [live]
+    for options in ({"color_scheme": "dark"}, {**PHONE, "color_scheme": "light"}):
+        pages.append(ui.open(room=room, **options))
+    for page in pages:
+        # A phone keeps Members in its bottom sheet.
+        if page.viewport_size and page.viewport_size["width"] < 760:
+            page.click("#buddy-toggle")
+        holder = page.locator('#buddy-list .member[data-name="claude-1"]')
+        expect(holder.locator(".m-claim-entry")).to_contain_text("build")
+        expect(holder.locator(".m-claim-entry")).to_contain_text("Expires")
+        expect(page.locator('#buddy-list .member[data-name="codex-1"] .m-claim-entry')).to_have_count(0)
+        no_horizontal_scroll(page)
+    wait_for(
+        lambda: (
+            ui.world.broker.on_loop(
+                lambda: sum(
+                    "#" + room in sub.rooms and "members" in sub.kinds and not sub.closed
+                    for sub in ui.world.broker.state.hub.subs
+                )
+            )
+            >= 3
+        ),
+        what="all three browsers' members subscriptions",
+    )
+    assert ui.world.agent_call("#" + room, "claude-1", "claim", key="build", ttl=0)["released"]
+    for page in pages:
+        expect(page.locator("#buddy-list .m-claim-entry")).to_have_count(0)
+
+
 def test_inspector_shows_the_member_detail(ui: UI) -> None:
     page = ui.open()
     with page.expect_response(lambda r: r.url.endswith("/api/rooms/build/members/bench")) as got:
@@ -957,6 +1038,53 @@ def test_inspector_hold_posts_the_command_and_shows_held(ui: UI) -> None:
             json={"text": "/release codex-1"},
             headers=ui.world.broker.write_headers(),
         )
+
+
+def test_members_say_when_held_chatter_wakes_an_agent_and_wake_now_sends_it(ui: UI) -> None:
+    """#137: another agent's chatter that addresses nobody waits on the hold, and the member list
+    says when it wakes the agent ("1 queued · wakes at 20:45") in light, dark and on the phone.
+    The Inspector's Wake now sends /wake through the composer's path, and its reply shows in the
+    log. The agent that wrote it waits on nothing. Fails without ``wakes_at`` in the members
+    frame, or without the button."""
+    room = "e2e-held-chatter"
+    ui.world.create_room("#" + room)
+    ui.world.add_agents("#" + room, ("claude-1", "codex-1"))
+    ui.world.agent_call("#" + room, "codex-1", "say", text="the cache key drops the host")
+
+    def idle() -> None:  # a scripted agent is busy after its join; the hold is for an idle one
+        st = ui.world.broker.state
+        r = st.store.get_room("#" + room)
+        assert r is not None
+        m = st.store.find_member(r.id, "claude-1")
+        assert m is not None
+        st.store.set_status(m.participant_id, "idle", "hook:Stop")
+        st.hub.members_changed("#" + room)
+
+    ui.world.broker.on_loop(idle)
+    when = re.compile(r"1 queued · wakes at \d\d:\d\d")
+    for options in ({"color_scheme": "light"}, {"color_scheme": "dark"}, {**PHONE, "color_scheme": "light"}):
+        page = ui.open(room=room, **options)
+        if "viewport" in options:
+            page.click("#buddy-toggle")
+        expect(page.locator('#buddy-list .member[data-name="claude-1"]')).to_contain_text(when)
+        expect(page.locator('#buddy-list .member[data-name="codex-1"]')).not_to_contain_text("wakes at")
+        no_horizontal_scroll(page)
+    page = ui.open(room=room)
+    page.click('#buddy-list .member[data-name="claude-1"]')
+    expect(page.locator("#insp-name")).to_contain_text("claude-1")
+    wake = page.locator("#insp-wake")
+    expect(wake).to_have_text("Wake now")
+    expect(page.locator("#insp-body .insp-actions .fine")).to_contain_text("Same as /wake, /hold")
+    with page.expect_request(
+        lambda r: r.method == "POST" and r.url.endswith(f"/api/rooms/{room}/command")
+    ) as req:
+        wake.click()
+    assert req.value.post_data_json == {"text": "/wake claude-1"}
+    expect(page.locator("#log .line.local").last).to_contain_text("waking claude-1 for 1 waiting message")
+    page = ui.open(room=room)  # the Inspector covers Members: start again for codex-1
+    page.click('#buddy-list .member[data-name="codex-1"]')
+    expect(page.locator("#insp-name")).to_contain_text("codex-1")
+    expect(page.locator("#insp-wake")).to_have_count(0)
 
 
 def test_slash_palette_and_mentions(ui: UI) -> None:
@@ -1656,6 +1784,59 @@ def test_a_long_remote_state_leaves_the_name_readable(ui: UI, size: str) -> None
     assert abs(both["name"][0] - both["state"][0]) <= 2, both  # a long name and a long state: half each
 
 
+def test_the_room_name_is_the_last_thing_the_header_shortens(ui: UI) -> None:
+    """The header's flex row shortened the room's name first: a 1280 px window with Members open
+    showed "s…" for #sprint-grooming, while "alice and 1 agent" and every chip stayed whole. The
+    name is what a person reads and, since #316, clicks to rename, so the chips give way first
+    (they scroll), then the member count, and the name last, at every text size. Fails if the
+    name or the member count is cut while the chips still have room to give."""
+    room = "sprint-grooming"
+    ui.world.create_room("#" + room)
+    ui.world.add_agents("#" + room, ("claude-1",))
+    page = ui.open(room=room, viewport={"width": 1280, "height": 800})
+    title = page.locator("#room-title-button")
+    expect(title).to_have_text(room)
+    whole = "el => el.scrollWidth <= el.clientWidth + 1"  # a fraction of a pixel isn't a cut
+    assert title.evaluate(whole), "the name is cut at 1280 px"
+    # the chips give way before the member count does: it is whole too, with no ellipsis
+    exact = "el => el.scrollWidth <= el.clientWidth"
+    assert page.locator("#room-sub").evaluate(exact), "the member count is cut at 1280 px"
+    expect(page.locator("#st-state")).to_be_in_viewport()  # the state chip keeps its place
+    page.set_viewport_size({"width": 1040, "height": 800})
+    expect(title).to_be_visible()
+    assert title.evaluate(whole), "the name is cut at 1040 px"
+    # something had to give at this width, and it was the chips, not the name
+    assert page.locator("#status-chips").evaluate("el => el.scrollWidth > el.clientWidth + 1")
+    # the larger text sizes capped the name at 140 px ("sprint-groo…"); they follow the same order
+    page.set_viewport_size({"width": 1280, "height": 800})
+    page.evaluate("document.documentElement.dataset.textSize = 'larger'")
+    assert title.evaluate(whole), "the name is cut at the larger text size"
+
+
+@pytest.mark.parametrize("scheme", ["light", "dark"])
+def test_a_phone_shows_a_room_name_that_fits(ui: UI, scheme: str) -> None:
+    """#333: the phone's header was three equal columns, so the title had a third of the screen
+    (about 125 px) whatever Rooms and the members pill needed, and #sprint-grooming read
+    "sprint-groo…" with empty space on both sides. The side columns now take what their buttons
+    need and the title has the rest. Fails if a 15-letter name is cut at 390 px, or if the title
+    runs under either button."""
+    room = "sprint-grooming-" + scheme[0]
+    ui.world.create_room("#" + room)
+    page = ui.open(room=room, color_scheme=scheme, **PHONE)
+    title = page.locator("#room-title-button")
+    expect(title).to_have_text(room)
+    assert title.evaluate("el => el.scrollWidth <= el.clientWidth + 1"), "the name is cut on a phone"
+    parts = ("#rooms-toggle", "#room-title", "#buddy-toggle")
+    nav, name, members = (page.locator(part).bounding_box() for part in parts)
+    assert nav and name and members
+    assert nav["x"] + nav["width"] <= name["x"] and name["x"] + name["width"] <= members["x"]
+    # at the largest text size the name can't fit: it ends in an ellipsis, between the buttons
+    page.evaluate("document.documentElement.dataset.textSize = 'larger'")
+    nav, name, members = (page.locator(part).bounding_box() for part in parts)
+    assert nav and name and members
+    assert nav["x"] + nav["width"] <= name["x"] + 1 and name["x"] + name["width"] <= members["x"] + 1
+
+
 def test_a_remote_rows_title_has_its_whole_state(ui: UI) -> None:
     """The row's title has the state in full, since the row may end it in an ellipsis, and it
     ticks with the retry countdown as the row's text does. /api/remotes answers with fpga-pi
@@ -2311,6 +2492,81 @@ def test_the_review_board_shows_each_item_in_its_lane(ui: UI) -> None:
     expect(page.locator("#board")).to_be_hidden()
 
 
+@pytest.mark.parametrize("options", (DESKTOP, PHONE), ids=("desktop", "phone"))
+def test_new_review_head_marks_only_unsettled_findings_on_the_open_page(
+    ui: UI, options: dict[str, Any]
+) -> None:
+    """An agent's new head appears live on old findings, not on a question or settled work."""
+    slug = "e2e-board-outdated-" + ("phone" if options is PHONE else "desktop")
+    room = "#" + slug
+    page = review_room(ui, slug, **options)
+    page.click("#board-toggle")
+    expect(page.locator("#board .board-outdated")).to_have_count(0)
+    # The board can be read through HTTP before the browser's hello subscribes to its live
+    # review frames. Wait for that event, so the agent move exercises the live update path.
+    wait_for(
+        lambda: ui.world.broker.on_loop(
+            lambda: any(
+                room in sub.rooms and "review" in sub.kinds and not sub.closed
+                for sub in ui.world.broker.state.hub.subs
+            )
+        ),
+        what="the browser's review subscription",
+    )
+    sha = "7b9c2a4d6e8f"
+    result = ui.world.agent_call(
+        room, "codex-1", "review", action="open", url="https://example.com/shop/pull/7", head=sha
+    )
+    assert result["ok"], result
+    for label in ("F3", "F4"):
+        expect(page.locator(f'#board .board-card[data-item="{label}"] .board-outdated')).to_have_text(
+            f"Outdated at {sha[:7]}"
+        )
+    for label in ("F1", "F2", "Q1"):
+        expect(page.locator(f'#board .board-card[data-item="{label}"] .board-outdated')).to_have_count(0)
+    page.locator('#board .board-card[data-item="F3"]').click()
+    expect(page.locator("#board .board-detail .board-outdated")).to_have_text(f"Outdated at {sha[:7]}")
+
+
+def test_a_stale_board_fetch_cannot_erase_a_live_head_move(ui: UI) -> None:
+    """A GET started before a review frame must not replace that newer board on arrival."""
+    slug = "e2e-board-stale-fetch"
+    room = "#" + slug
+    page = review_room(ui, slug)
+    page.evaluate("""() => {
+      const original = window.fetch.bind(window);
+      window.fetch = async (input, options) => {
+        const response = await original(input, options);
+        if (String(input).endsWith('/review') && !window.heldBoardFetch) {
+          window.heldBoardFetch = true;
+          await new Promise(resolve => { window.releaseBoardFetch = resolve; });
+        }
+        return response;
+      };
+    }""")
+    page.click("#board-toggle")
+    wait_js(page, "() => window.heldBoardFetch === true")
+    wait_for(
+        lambda: ui.world.broker.on_loop(
+            lambda: any(
+                room in sub.rooms and "review" in sub.kinds and not sub.closed
+                for sub in ui.world.broker.state.hub.subs
+            )
+        ),
+        what="the browser's review subscription",
+    )
+    sha = "7b9c2a4d6e8f"
+    result = ui.world.agent_call(
+        room, "codex-1", "review", action="open", url="https://example.com/shop/pull/7", head=sha
+    )
+    assert result["ok"], result
+    mark = page.locator('#board .board-card[data-item="F3"] .board-outdated')
+    expect(mark).to_have_text(f"Outdated at {sha[:7]}")
+    page.evaluate("() => window.releaseBoardFetch()")
+    page.evaluate("() => new Promise(resolve => setTimeout(resolve, 0))")
+    expect(mark).to_have_text(f"Outdated at {sha[:7]}")
+
+
 def test_the_three_lanes_sit_in_one_row_and_stack_on_a_phone(ui: UI) -> None:
     """#250: on a desktop the lanes are one row, in the order a finding lives (no lane wraps
     under another); on a phone they stack, with Needs you first."""
@@ -2418,6 +2674,127 @@ def test_a_contested_finding_shows_both_sides(ui: UI) -> None:
     expect(page.locator("#board-concede")).to_be_visible()
 
 
+def _width(loc: Any) -> float:
+    box = loc.bounding_box()
+    assert box is not None
+    return float(box["width"])
+
+
+def test_the_open_card_is_resized_by_its_divider(ui: UI) -> None:
+    """#343: the open card was a fixed 340 px, cramped beside lanes with room to spare. It opens
+    at a share of the board now, and the divider between the two trades width: dragged, or with
+    the arrow keys, Home and End. The widths are rungs 24 px apart (the page writes no styles,
+    so each is a class). The card never goes under 340 px or the lanes under 420, the next card
+    opens at the width this one was left at, and a double-click goes back to the share. Fails
+    if the card's width is fixed, if a limit doesn't hold, or if a redraw of the board (every
+    click on a card is one) forgets the width."""
+    page = review_room(ui, "e2e-board-divider", viewport={"width": 1600, "height": 900})
+    page.click("#board-toggle")
+    page.click('#board .board-card[data-item="F3"]')
+    detail, lanes, divider = (
+        page.locator("#board " + part) for part in (".board-detail", ".board-lanes", "#board-divider")
+    )
+    opened, both = _width(detail), _width(detail) + _width(lanes)
+    assert opened > 400, opened  # a share of the board, not the old 340 px
+    expect(divider).to_have_attribute("role", "separator")
+    expect(divider).to_have_attribute("aria-valuenow", str(round(opened)))
+    expect(divider).to_have_attribute("aria-valuemin", "340")
+    # the keys: Home is the card's smallest width, Left widens it a rung, Right narrows it
+    divider.focus()
+    page.keyboard.press("Home")
+    assert abs(_width(detail) - 340) <= 1
+    page.keyboard.press("ArrowRight")  # and no narrower
+    assert abs(_width(detail) - 340) <= 1
+    page.keyboard.press("ArrowLeft")
+    page.keyboard.press("ArrowLeft")
+    assert abs(_width(detail) - 388) <= 1
+    page.keyboard.press("ArrowRight")
+    assert abs(_width(detail) - 364) <= 1
+    expect(divider).to_have_attribute("aria-valuenow", "364")
+    # drag it 100 px to the left: the card gains them (to the nearest rung), the lanes lose them
+    grip = divider.bounding_box()
+    assert grip is not None
+    x, y = grip["x"] + grip["width"] / 2, grip["y"] + 20
+    page.mouse.move(x, y)
+    page.mouse.down()
+    page.mouse.move(x - 100, y, steps=5)
+    page.mouse.up()
+    assert abs(_width(detail) - 464) <= 12, _width(detail)
+    assert abs(_width(detail) + _width(lanes) - both) <= 1  # what one gains the other loses
+    expect(divider).to_have_attribute("aria-valuenow", str(round(_width(detail))))
+    expect(divider).to_be_focused()  # the drag left the focus on it, for the keys
+    # End, and a drag far past it, stop where the lanes are at their smallest
+    page.keyboard.press("End")
+    assert abs(_width(lanes) - 420) <= 1, _width(lanes)
+    expect(divider).to_have_attribute("aria-valuenow", divider.get_attribute("aria-valuemax") or "")
+    page.keyboard.press("ArrowLeft")  # already at the limit
+    assert abs(_width(lanes) - 420) <= 1
+    page.keyboard.press("ArrowRight")
+    grip = divider.bounding_box()
+    assert grip is not None
+    page.mouse.move(grip["x"] + 5, grip["y"] + 20)
+    page.mouse.down()
+    page.mouse.move(grip["x"] - 700, grip["y"] + 20, steps=5)
+    page.mouse.up()
+    assert abs(_width(lanes) - 420) <= 1
+    # the next card opens at the width this one was left at
+    page.keyboard.press("Home")
+    page.keyboard.press("ArrowLeft")
+    page.click('#board .board-card[data-item="Q1"]')
+    expect(page.locator("#board .board-detail h3")).to_contain_text("Q1")
+    assert abs(_width(detail) - 364) <= 1, _width(detail)
+    # a double-click goes back to the card's share of the board
+    divider.dblclick()
+    assert abs(_width(detail) - opened) <= 1
+
+
+def test_a_contested_findings_sides_stack_in_a_narrow_card(ui: UI) -> None:
+    """#343: side by side in a 340 px card, each side of a contested finding got about 150 px, a
+    few words to a line. Under 440 px of card the sides go one above the other, each the card's
+    width; from 440 px they sit side by side, as #250 drew them. Fails if a narrow card keeps
+    two columns."""
+    page = review_room(ui, "e2e-board-sides-stack", viewport={"width": 1600, "height": 900})
+    page.click("#board-toggle")
+    page.click('#board .board-card[data-item="F3"]')
+    sides = page.locator("#board .board-detail .board-side")
+    expect(sides).to_have_count(2)
+    assert _width(page.locator("#board .board-detail")) >= 440
+    first, second = sides.nth(0).bounding_box(), sides.nth(1).bounding_box()
+    assert first and second
+    assert abs(first["y"] - second["y"]) <= 1 and second["x"] > first["x"]  # side by side
+    page.locator("#board-divider").focus()
+    page.keyboard.press("Home")  # the card at its narrowest, 340 px
+    first, second = sides.nth(0).bounding_box(), sides.nth(1).bounding_box()
+    assert first and second
+    assert second["y"] >= first["y"] + first["height"], (first, second)  # one above the other
+    assert first["width"] > 280 and abs(first["x"] - second["x"]) <= 1
+
+
+def test_the_open_card_goes_under_the_lanes_when_both_cannot_fit(ui: UI) -> None:
+    """#343: in a 1280 px window with Members open the board is about 700 px wide, and a 340 px
+    card beside the lanes left them about 110 px each, titles wrapping every few letters. Under
+    778 px of board the card goes under the lanes, which keep the board's width, and there is no
+    divider. The rule follows the board's width, not the window's: closing Members puts the
+    card back beside the lanes. Fails if the lanes are squeezed beside the card."""
+    page = review_room(ui, "e2e-board-under", viewport={"width": 1280, "height": 800})
+    page.click("#board-toggle")
+    page.click('#board .board-card[data-item="Q1"]')
+    detail, lanes, divider = (
+        page.locator("#board " + part) for part in (".board-detail", ".board-lanes", "#board-divider")
+    )
+    expect(detail).to_be_visible()
+    expect(divider).to_be_hidden()
+    lanes_box, card_box = lanes.bounding_box(), detail.bounding_box()
+    assert lanes_box and card_box
+    assert card_box["y"] >= lanes_box["y"] + lanes_box["height"], (lanes_box, card_box)
+    assert lanes_box["width"] > 600 and abs(card_box["width"] - lanes_box["width"]) <= 1
+    page.click("#pane-toggle")  # Members closes: the board is wide enough for both
+    expect(divider).to_be_visible()
+    lanes_box, card_box = lanes.bounding_box(), detail.bounding_box()
+    assert lanes_box and card_box
+    assert card_box["x"] >= lanes_box["x"] + lanes_box["width"] and lanes_box["width"] >= 420
+
+
 def test_a_person_answers_a_question_and_rules_on_a_finding(ui: UI) -> None:
     """Answering Q1 and conceding the contested F3 move their cards at once (the board frame),
     and each is the person's own message in the room, which reaches the agents."""
@@ -2440,6 +2817,66 @@ def test_a_person_answers_a_question_and_rules_on_a_finding(ui: UI) -> None:
     page.click("#board-toggle")
     expect(chat_row(page, "Review board: Q1")).to_contain_text("answered with option 0")
     expect(chat_row(page, "Review board: F3")).to_contain_text("conceded, owner codex-1")
+
+
+def test_a_person_reassigns_a_finding_rules_it_fixed_and_the_owner_isnt_its_raiser_by_default(
+    ui: UI,
+) -> None:
+    """#371: the Owner picker preselected the room's first agent, often the raiser, so a person's
+    concede gave the fix to the agent that asked for it. It now preselects another agent. A
+    conceded finding can be reassigned, or ruled fixed by the person, which settles it. Fails if
+    the raiser is preselected, or a conceded card offers neither."""
+    slug = "e2e-board-unstick"
+    ui.world.create_room("#" + slug)
+    ui.world.add_agents("#" + slug, ("codex-1", "claude-1", "devin-1"))  # the raiser first, as in #371
+    ui.world.seed_review("#" + slug)
+    page = ui.open(room=None)
+    open_room(page, slug)
+    page.click("#board-toggle")
+    page.click('#board .board-card[data-item="F3"]')  # raised by codex-1, contested by claude-1
+    expect(page.locator("#board-owner")).to_have_value("claude-1")
+    page.click("#board-concede")
+    card = page.locator('#board .lane-working .board-card[data-item="F3"]')
+    expect(card).to_contain_text("owner claude-1")
+    # the card stays open on F3, now with what a conceded finding offers
+    expect(page.locator("#board-reassign-owner")).to_have_value("devin-1")  # not its owner or raiser
+    page.click("#board-reassign")
+    expect(card).to_contain_text("owner devin-1")
+    page.click("#board-mark-fixed")
+    expect(page.locator('#board .lane-settled .board-card[data-item="F3"]')).to_be_visible()
+    page.click("#board-toggle")
+    expect(chat_row(page, "Review board: F3 reassigned")).to_contain_text("reassigned to devin-1")
+    expect(chat_row(page, "Review board: F3 marked")).to_contain_text("marked fixed")
+
+
+def test_a_person_defers_a_finding_to_a_follow_up_ticket(ui: UI) -> None:
+    """#371: Defer settles a finding for this pull request with the ticket it goes to, shown as
+    "Deferred to" (not struck out like a drop). It needs the ticket first. Fails without the
+    action, or if the card reads as dropped."""
+    page = review_room(ui, "e2e-board-defer")
+    page.click("#board-toggle")
+    page.click('#board .board-card[data-item="F3"]')
+    page.click("#board-defer")
+    expect(page.locator("#board-ticket")).to_be_focused()  # no ticket yet: nothing is sent
+    page.fill("#board-ticket", "SHOP-123")
+    page.click("#board-defer")
+    card = page.locator('#board .lane-settled .board-card[data-item="F3"]')
+    expect(card).to_contain_text("Deferred to SHOP-123")
+    expect(card.locator(".board-state")).to_have_text("Deferred")
+    expect(card).not_to_have_class(re.compile(r"\bdropped\b"))
+    page.click("#board-toggle")
+    expect(chat_row(page, "Review board: F3 deferred")).to_contain_text("deferred to SHOP-123")
+
+
+def test_the_board_header_says_what_an_agent_reported_and_whose_it_is(ui: UI) -> None:
+    """#291: the header shows what an agent last read off the pull request, named as that
+    agent's, so a person sees "settled here, 2 open on the PR". Fails without the line."""
+    page = review_room(ui, "e2e-board-report")
+    ui.world.agent_call("#e2e-board-report", "claude-1", "review", action="report", threads=2, ci="failing")
+    page.click("#board-toggle")
+    report = page.locator("#board-report")
+    expect(report).to_have_text(re.compile(r"^2 open on the PR, CI failing \(per claude-1, "))
+    expect(report).to_have_attribute("title", re.compile(r"^claude-1 read this off the pull request"))
 
 
 def test_dropping_needs_a_reason_and_closing_asks_first(ui: UI) -> None:

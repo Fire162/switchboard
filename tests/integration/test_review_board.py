@@ -120,8 +120,13 @@ async def test_fix_requires_proof_and_the_raiser_confirms_it(broker: InProcBroke
     assert tuple(row) == ("tests/test_cart.py::test_total", "codex-1", "")
 
 
-async def test_a_person_confirms_only_when_the_raiser_cannot(broker: InProcBroker) -> None:
-    """The person cannot preempt an active independent raiser, but can check after they leave."""
+async def test_a_person_confirms_any_fix_and_the_board_still_flags_the_ones_that_need_them(
+    broker: InProcBroker,
+) -> None:
+    """#371: a person's ruling settles a fix, whether or not its raiser is still in the room (the
+    raiser couldn't always check it: an older switchboard, or a restart under another name). The
+    board still marks the fixes that need a person, once the raiser has left. Before, a person was
+    refused while the raiser was in the room, and a board like #371's could never settle."""
     web = broker.web_client()
     try:
         async with (
@@ -132,21 +137,156 @@ async def test_a_person_confirms_only_when_the_raiser_cannot(broker: InProcBroke
             await reviewer.join("#build", "codex-1")
             await reviewer.call("review", room="#build", action="open", url=PR)
             await reviewer.call("review", room="#build", action="raise", title="wrong total")
-            await author.call("review", room="#build", action="concede", item="F1")
-            await author.call(
-                "review", room="#build", action="fix", item="F1", commit="abc1234", proof="test_total"
-            )
+            await reviewer.call("review", room="#build", action="raise", title="rounding")
+            for item in ("F1", "F2"):
+                await author.call("review", room="#build", action="concede", item=item)
+                await author.call(
+                    "review", room="#build", action="fix", item=item, commit="abc1234", proof="test_total"
+                )
             path = "/api/rooms/build/review"
-            denied = web.post(path, json={"action": "confirm", "item": "F1"}, headers=broker.write_headers())
-            assert denied.status_code == 400 and "codex-1" in denied.json()["message"]
-            await reviewer.leave("#build")
             board = web.get(path).json()["board"]
-            assert board["items"][0]["needs_person"]
+            assert not board["items"][0]["needs_person"]  # its raiser is here to check it
             confirmed = web.post(
                 path, json={"action": "confirm", "item": "F1"}, headers=broker.write_headers()
             )
-            assert confirmed.status_code == 200 and confirmed.json()["board"]["settled"]
+            assert confirmed.status_code == 200, confirmed.text
             assert confirmed.json()["board"]["items"][0]["confirmed_by"] == "alice"
+            await reviewer.leave("#build")
+            board = web.get(path).json()["board"]
+            assert board["items"][1]["needs_person"]  # no raiser left to check F2
+            confirmed = web.post(
+                path, json={"action": "confirm", "item": "F2"}, headers=broker.write_headers()
+            )
+            assert confirmed.status_code == 200 and confirmed.json()["board"]["settled"]
+    finally:
+        web.close()
+
+
+async def test_a_board_from_371_reaches_settled(broker: InProcBroker) -> None:
+    """#371's board: the author restarts and comes back as claude-2, so F1, conceded to claude-1,
+    was no one's to fix; a person conceded F2 and the raiser couldn't move it. claude-2 now takes
+    F1 over (the owner has left) and fixes it for the raiser to confirm; a person reassigns F2 to
+    claude-2 and, for F3, rules it fixed themselves. The board settles. Fails if any of the three
+    moves is refused, as each was."""
+    web = broker.web_client()
+    path = "/api/rooms/build/review"
+
+    def person(body: dict[str, Any]) -> dict[str, Any]:
+        r = web.post(path, json=body, headers=broker.write_headers())
+        assert r.status_code == 200, r.text
+        return r.json()["board"]
+
+    try:
+        async with (
+            FakeAgent(broker.home, "k371-old") as old,
+            FakeAgent(broker.home, "k371-new") as new,
+            FakeAgent(broker.home, "k371-rev") as reviewer,
+        ):
+            await old.join("#build", "claude-1")
+            await reviewer.join("#build", "codex-1")
+            await reviewer.call("review", room="#build", action="open", url=PR)
+            for title in ("wrong total", "rounding", "naming"):
+                await reviewer.call("review", room="#build", action="raise", title=title)
+            for item in ("F1", "F2", "F3"):
+                await old.call("review", room="#build", action="concede", item=item)
+            await old.leave("#build")  # a restart: the session comes back under another name
+            await new.join("#build", "claude-2")
+            r = await new.call("review", room="#build", action="fix", item="F1", commit="abc1234", proof="t")
+            assert r.get("ok") is False and "take it over first" in r["error"], r
+            r = await new.call("review", room="#build", action="concede", item="F1")
+            assert r["ok"], r
+            r = await new.call("review", room="#build", action="fix", item="F1", commit="abc1234", proof="t")
+            assert r["ok"], r
+            r = await reviewer.call("review", room="#build", action="confirm", item="F1")
+            assert r["ok"], r
+            board = person({"action": "concede", "item": "F2", "owner": "claude-2"})
+            assert board["items"][1]["owner"] == "claude-2"
+            r = await new.call("review", room="#build", action="fix", item="F2", commit="abc1234", proof="t")
+            assert r["ok"], r
+            await reviewer.call("review", room="#build", action="confirm", item="F2")
+            board = person({"action": "fix", "item": "F3"})
+            assert board["items"][2]["state"] == "fixed" and board["items"][2]["confirmed_by"] == "alice"
+            assert board["settled"], board
+        texts = [m["text"] for m in web.get("/api/rooms/build/messages").json()["messages"]]
+        assert any("Review board: F2 reassigned to claude-2" in t for t in texts), texts
+        assert any("Review board: F3 marked fixed" in t for t in texts), texts
+    finally:
+        web.close()
+
+
+async def test_findings_deferred_to_a_ticket_settle_the_board(broker: InProcBroker) -> None:
+    """#371: six findings agreed for a follow-up ticket had no outcome to record. The raiser
+    defers one with the ticket as the reason (the author can't: deferring is the raiser's call,
+    like dropping), a person defers another from the page with the ticket, both read "deferred
+    to" on the board, and the board settles. Fails if defer is refused, settles nothing, or reads
+    as a plain drop."""
+    web = broker.web_client()
+    path = "/api/rooms/build/review"
+    try:
+        async with FakeAgent(broker.home, "kd-a") as author, FakeAgent(broker.home, "kd-r") as reviewer:
+            await author.join("#build", "claude-1")
+            await reviewer.join("#build", "codex-1")
+            await reviewer.call("review", room="#build", action="open", url=PR)
+            await reviewer.call("review", room="#build", action="raise", title="split the module")
+            await reviewer.call("review", room="#build", action="raise", title="rename the flag")
+            r = await author.call("review", room="#build", action="defer", item="F1", reason="SHOP-123")
+            assert r.get("ok") is False and "or a person can defer it" in r["error"], r
+            r = await reviewer.call("review", room="#build", action="defer", item="F1", reason="SHOP-123")
+            assert r["ok"] and "deferred to SHOP-123" in r["board"], r
+            r = web.post(
+                path,
+                json={"action": "defer", "item": "F2", "reason": "SHOP-124"},
+                headers=broker.write_headers(),
+            )
+            assert r.status_code == 200, r.text
+            board = r.json()["board"]
+            assert [i["deferred_to"] for i in board["items"]] == ["SHOP-123", "SHOP-124"]
+            assert board["settled"], board
+        texts = [m["text"] for m in web.get("/api/rooms/build/messages").json()["messages"]]
+        assert any("Review board: F2 deferred to SHOP-124" in t for t in texts), texts
+    finally:
+        web.close()
+
+
+async def test_an_agent_reports_the_pull_request_and_a_merge_closes_the_board(broker: InProcBroker) -> None:
+    """#291: the board read settled while a person had threads open on the PR, stayed open after
+    the merge, and agents passed CI on from memory. An agent reports what gh shows: the board
+    says it, as that agent's, with how many threads are open; a new CI result is one line in the
+    room; a reported merge closes the board with one line naming who reported it. A state the
+    board doesn't know is refused. Fails if a report is dropped, unattributed, or a merge leaves
+    the board open."""
+    web = broker.web_client()
+    try:
+        async with FakeAgent(broker.home, "kp-a") as author, FakeAgent(broker.home, "kp-r") as reviewer:
+            await author.join("#build", "claude-1")
+            await reviewer.join("#build", "codex-1")
+            await reviewer.call("review", room="#build", action="open", url=PR)
+            r = await author.call("review", room="#build", action="report", state="approved")
+            assert r.get("ok") is False and "state must be one of" in r["error"], r
+            r = await author.call(
+                "review", room="#build", action="report", state="open", threads=2, ci="failing"
+            )
+            assert r["ok"] and "2 open on the PR, CI failing (per claude-1" in r["board"], r
+            page = web.get("/api/rooms/build/review").json()["board"]
+            assert page["report"].startswith("2 open on the PR, CI failing (per claude-1")
+            assert (page["pr_threads"], page["pr_ci"], page["reported_by"]) == (2, "failing", "claude-1")
+            r = await reviewer.call("review", room="#build", action="report", ci="failing")
+            assert r["ok"], r  # the same CI result again: no second line
+            r = await reviewer.call("review", room="#build", action="report", ci="passing", threads=0)
+            assert r["ok"] and "no threads open on the PR, CI passing (per codex-1" in r["board"], r
+            r = await author.call("review", room="#build", action="report", state="merged")
+            assert r["ok"] and r.get("closed") is True, r
+            assert web.get("/api/rooms/build/review").json()["board"] is None
+        texts = [
+            m["text"]
+            for m in web.get("/api/rooms/build/messages").json()["messages"]
+            if m["kind"] == "notice"
+        ]
+        ci_lines = [t for t in texts if "reports CI" in t]
+        assert ci_lines == [f"claude-1 reports CI failing on {PR}", f"codex-1 reports CI passing on {PR}"], (
+            texts
+        )
+        assert f"claude-1 reports {PR} merged: the review board is closed" in texts, texts
     finally:
         web.close()
 

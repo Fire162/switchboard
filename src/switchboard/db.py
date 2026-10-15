@@ -29,7 +29,7 @@ from switchboard.models import Room, room_slug
 
 log = logging.getLogger("switchboard.db")
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 24
 
 SCHEMA = r"""
 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -187,7 +187,11 @@ CREATE TABLE room_people(
 CREATE TABLE reviews(
   id INTEGER PRIMARY KEY, room_id INTEGER NOT NULL REFERENCES rooms(id),
   url TEXT NOT NULL CHECK(length(url) <= 500), head TEXT NOT NULL DEFAULT '' CHECK(length(head) <= 64),
-  opened_by TEXT NOT NULL, opened_at REAL NOT NULL, closed_at REAL, posted_at REAL, posted_by TEXT);
+  opened_by TEXT NOT NULL, opened_at REAL NOT NULL, closed_at REAL, posted_at REAL, posted_by TEXT,
+  pr_state TEXT NOT NULL DEFAULT '' CHECK(pr_state IN ('', 'open', 'merged', 'closed')),
+  pr_threads INTEGER CHECK(pr_threads IS NULL OR pr_threads BETWEEN 0 AND 999),
+  pr_ci TEXT NOT NULL DEFAULT '' CHECK(pr_ci IN ('', 'passing', 'failing', 'running', 'none')),
+  reported_by TEXT NOT NULL DEFAULT '' CHECK(length(reported_by) <= 100), reported_at REAL);
 CREATE INDEX reviews_room ON reviews(room_id, id);
 CREATE TABLE review_items(
   id INTEGER PRIMARY KEY, review_id INTEGER NOT NULL REFERENCES reviews(id),
@@ -204,7 +208,22 @@ CREATE TABLE review_items(
   answered_by TEXT NOT NULL DEFAULT '', created_at REAL NOT NULL, updated_at REAL NOT NULL,
   proof TEXT NOT NULL DEFAULT '' CHECK(length(proof) <= 500),
   confirmed_by TEXT NOT NULL DEFAULT '' CHECK(length(confirmed_by) <= 100),
+  outdated_head TEXT NOT NULL DEFAULT '' CHECK(length(outdated_head) <= 64),
+  deferred_to TEXT NOT NULL DEFAULT '' CHECK(length(deferred_to) <= 200),
   UNIQUE(review_id, kind, n));
+
+CREATE TABLE claims(
+  room_id INTEGER NOT NULL REFERENCES rooms(id),
+  key_norm TEXT NOT NULL CHECK(length(key_norm) BETWEEN 1 AND 512),
+  key TEXT NOT NULL CHECK(length(key) BETWEEN 1 AND 120),
+  membership_id INTEGER NOT NULL REFERENCES memberships(id),
+  expires_at REAL NOT NULL,
+  PRIMARY KEY(room_id, key_norm)) WITHOUT ROWID;
+CREATE INDEX claims_member ON claims(membership_id);
+CREATE TABLE pins(
+  room_id INTEGER NOT NULL REFERENCES rooms(id), message_id INTEGER NOT NULL REFERENCES messages(id),
+  pinned_by TEXT NOT NULL CHECK(length(pinned_by) <= 100), pinned_at REAL NOT NULL,
+  PRIMARY KEY(room_id, message_id));
 """
 
 TABLES = (
@@ -225,6 +244,8 @@ TABLES = (
     "reviews",
     "review_items",
     "room_people",
+    "claims",
+    "pins",
 )
 # the tables of a version-1 database (0.1.0, 0.2.0) and of a version-2 one (0.3.0 to 0.6.5):
 # the rows a migration must keep
@@ -234,6 +255,8 @@ V3_TABLES = TABLES[:12]
 V4_TABLES = TABLES[:13]
 V8_TABLES = TABLES[:14]
 V14_TABLES = TABLES[:16]  # before room_people (v15)
+V20_TABLES = TABLES[:17]  # before claims (v21)
+V21_TABLES = TABLES[:18]  # before pins (v22)
 
 # v1 -> v2 (DESIGN.md §27.6): one BEGIN IMMEDIATE, after a verified backup. The
 # columns land at the end of their tables, where the fresh schema above puts them too.
@@ -426,6 +449,58 @@ V18_TO_V19 = (
     "UPDATE meta SET value='19' WHERE key='schema_version'",
 )
 
+# v19 -> v20 (#291): an unsettled finding can be flagged when the board's head changes.
+V19_TO_V20 = (
+    "ALTER TABLE review_items ADD COLUMN outdated_head TEXT NOT NULL DEFAULT ''"
+    " CHECK(length(outdated_head) <= 64)",
+    "UPDATE meta SET value='20' WHERE key='schema_version'",
+)
+
+# v20 -> v21 (#293): claims are advisory, per room, and tied to one membership.
+V20_TO_V21 = (
+    "CREATE TABLE claims("
+    " room_id INTEGER NOT NULL REFERENCES rooms(id),"
+    " key_norm TEXT NOT NULL CHECK(length(key_norm) BETWEEN 1 AND 512),"
+    " key TEXT NOT NULL CHECK(length(key) BETWEEN 1 AND 120),"
+    " membership_id INTEGER NOT NULL REFERENCES memberships(id),"
+    " expires_at REAL NOT NULL,"
+    " PRIMARY KEY(room_id, key_norm)) WITHOUT ROWID",
+    "CREATE INDEX claims_member ON claims(membership_id)",
+    "UPDATE meta SET value='21' WHERE key='schema_version'",
+)
+
+# v21 -> v22 (#292, DESIGN.md §48): a room's pinned decisions, at most five, by message. The
+# table is new, so every existing room starts with none.
+V21_TO_V22 = (
+    "CREATE TABLE pins("
+    " room_id INTEGER NOT NULL REFERENCES rooms(id), message_id INTEGER NOT NULL REFERENCES messages(id),"
+    " pinned_by TEXT NOT NULL CHECK(length(pinned_by) <= 100), pinned_at REAL NOT NULL,"
+    " PRIMARY KEY(room_id, message_id))",
+    "UPDATE meta SET value='22' WHERE key='schema_version'",
+)
+
+# v22 -> v23 (#371, DESIGN.md §37.2): a finding deferred to a follow-up ticket. It is a dropped
+# finding with the ticket it went to, so everything that settles a dropped one settles it too.
+V22_TO_V23 = (
+    "ALTER TABLE review_items ADD COLUMN deferred_to TEXT NOT NULL DEFAULT ''"
+    " CHECK(length(deferred_to) <= 200)",
+    "UPDATE meta SET value='23' WHERE key='schema_version'",
+)
+
+# v23 -> v24 (#291, DESIGN.md §37.11): what an agent read off the pull request with its own gh or
+# glab and reported to the board: its state, the threads still open on it, its CI, by whom, when.
+V23_TO_V24 = (
+    "ALTER TABLE reviews ADD COLUMN pr_state TEXT NOT NULL DEFAULT ''"
+    " CHECK(pr_state IN ('', 'open', 'merged', 'closed'))",
+    "ALTER TABLE reviews ADD COLUMN pr_threads INTEGER"
+    " CHECK(pr_threads IS NULL OR pr_threads BETWEEN 0 AND 999)",
+    "ALTER TABLE reviews ADD COLUMN pr_ci TEXT NOT NULL DEFAULT ''"
+    " CHECK(pr_ci IN ('', 'passing', 'failing', 'running', 'none'))",
+    "ALTER TABLE reviews ADD COLUMN reported_by TEXT NOT NULL DEFAULT '' CHECK(length(reported_by) <= 100)",
+    "ALTER TABLE reviews ADD COLUMN reported_at REAL",
+    "UPDATE meta SET value='24' WHERE key='schema_version'",
+)
+
 
 def _steps(frm: int) -> list[tuple[int, tuple[str, ...], tuple[str, ...]]]:
     """The migration steps from schema ``frm`` up to the current one: (to, statements,
@@ -449,6 +524,11 @@ def _steps(frm: int) -> list[tuple[int, tuple[str, ...], tuple[str, ...]]]:
         16: (17, V16_TO_V17, ()),
         17: (18, V17_TO_V18, ()),
         18: (19, V18_TO_V19, ()),
+        19: (20, V19_TO_V20, ()),
+        20: (21, V20_TO_V21, ("claims",)),
+        21: (22, V21_TO_V22, ("pins",)),
+        22: (23, V22_TO_V23, ()),
+        23: (24, V23_TO_V24, ()),
     }
     out = []
     v = frm
@@ -473,6 +553,10 @@ def tables_of(version: int) -> tuple[str, ...]:
         return V8_TABLES
     if version <= 14:
         return V14_TABLES
+    if version <= 20:
+        return V20_TABLES
+    if version <= 21:
+        return V21_TABLES
     return TABLES
 
 

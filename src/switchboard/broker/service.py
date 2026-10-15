@@ -35,12 +35,14 @@ from switchboard.envelope import clean
 from switchboard.models import (
     CONTINUE_PATHS,
     HOOK_PATHS,
+    MAX_PINS,
     PRIO_LABEL,
     PULL_PATHS,
     SCREEN_NAME_RE,
     InvalidName,
     Member,
     Message,
+    Pin,
     Room,
     closed_room_name,
     display_room,
@@ -105,6 +107,8 @@ class DeliveryHooks(Protocol):
 
     def parked_reason(self, membership_id: int) -> str | None: ...
 
+    def wakes_at(self, membership_id: int) -> float | None: ...
+
     def board_reason(self, member: Member) -> str | None: ...
 
     def member_claims(self, member: Member) -> tuple[str | None, tuple[str, ...] | None]: ...
@@ -142,6 +146,27 @@ def message_dict(m: Message) -> dict[str, Any]:
     return d
 
 
+PIN_TEXT_MAX = 300  # a pin's text in the room header: the strip shows its first line
+
+
+def pin_dict(p: Pin) -> dict[str, Any]:
+    """One pinned message as the web UI's header strip shows it (#292, DESIGN.md §48): who said
+    it, who pinned it, and its text display-cleaned and cut (the message itself has the rest)."""
+    m = p.message
+    text = clean(m.text)
+    return {
+        "id": m.id,
+        "ts": m.ts,
+        "from": m.sender_name,
+        "harness": m.sender_harness,
+        "sender_kind": m.sender_kind,
+        "host": m.sender_host,
+        "text": text[:PIN_TEXT_MAX],
+        "cut": len(text) > PIN_TEXT_MAX,
+        "pinned_by": p.pinned_by,
+    }
+
+
 def member_dict(m: Member) -> dict[str, Any]:
     return {
         "name": m.name,
@@ -157,6 +182,8 @@ def member_dict(m: Member) -> dict[str, Any]:
         "env_leak": m.env_leak,
         "held": m.held,
         "queued": m.queued,
+        # when the hold on unaddressed chatter (#137) lets the queued messages wake it, or None
+        "wakes_at": m.wakes_at,
         "inflight": m.inflight,
         "parked": m.parked,
         "parked_reason": m.parked_reason,
@@ -166,6 +193,7 @@ def member_dict(m: Member) -> dict[str, Any]:
         "board_why": m.board_why,
         "version_claim": m.version_claim or "unknown",
         "tools_claim": list(m.tools_claim) if m.tools_claim is not None else None,
+        "claims": list(m.claims),
     }
 
 
@@ -292,10 +320,39 @@ class RoomService:
             "last_id": self.store.last_message_id(room.id),
             "settings": self.settings(room),
             "rules": room.rules_text,
+            "pins": self.pins_payload(room),
             # a private room's people, who alone see it (§44); None for a public room
             "private": room.private,
             "people": self.room_people_names(room) if room.private else None,
         }
+
+    # ------------------------------------------------------ pinned decisions (#292, §48)
+    def pins_payload(self, room: Room) -> list[dict[str, Any]]:
+        return [pin_dict(p) for p in self.store.pins(room.id)]
+
+    def pin_message(self, room: Room, message_id: int, by: str) -> tuple[bool, Message]:
+        """Pin a chat message of ``room`` (a person's call: only ``/pin`` reaches this, and an
+        agent's ``say`` is never parsed). ``(False, msg)`` if it already was. A room has at most
+        ``MAX_PINS``; a sixth is refused, with what to do. The page is told on the next
+        ``pins_changed``."""
+        msg = self._chat_message(room, message_id)
+        try:
+            return self.store.pin_add(room.id, msg.id, by), msg
+        except Conflict:
+            raise ServiceError(
+                "conflict",
+                f"{room.name} has {MAX_PINS} pinned messages already: unpin one first (/unpin <message id>)",
+            ) from None
+
+    def unpin_message(self, room: Room, message_id: int) -> tuple[bool, Message]:
+        msg = self._chat_message(room, message_id)
+        return self.store.pin_remove(room.id, msg.id), msg
+
+    def _chat_message(self, room: Room, message_id: int) -> Message:
+        msg = self.store.get_message(message_id) if 0 < message_id <= MAX_MESSAGE_ID else None
+        if msg is None or msg.room_id != room.id or msg.kind != "chat":
+            raise ServiceError("not_found", f"no chat message {message_id} in {room.name}")
+        return msg
 
     def rooms(self, viewer: int | None = None) -> list[dict[str, Any]]:
         """The open rooms ``viewer`` sees (§44): every public one, and the private ones they're in."""
@@ -468,7 +525,20 @@ class RoomService:
     def member_rows(self, room_id: int) -> list[Member]:
         """Buddy-list rows, with the engine's parked state, and whether each can use the review
         board, overlaid."""
-        rows = self.store.members(room_id)
+        by_member: dict[int, list[dict[str, Any]]] = {}
+        now = self.clock.now()
+        for claim in self.store.claims_for_room(room_id):
+            by_member.setdefault(claim.membership_id, []).append(
+                {
+                    "key": claim.key,
+                    "expires_at": claim.expires_at,
+                    "remaining_s": max(0.0, claim.expires_at - now),
+                }
+            )
+        rows = [
+            dataclasses.replace(m, claims=tuple(by_member.get(m.membership_id, ())))
+            for m in self.store.members(room_id)
+        ]
         if self.delivery is None:
             return rows
         out = []
@@ -478,7 +548,12 @@ class RoomService:
                 m = dataclasses.replace(m, parked=True, parked_reason=why)
             board = self.delivery.board_reason(m)
             version, tools = self.delivery.member_claims(m)
-            out.append(dataclasses.replace(m, board_why=board, version_claim=version, tools_claim=tools))
+            wakes = self.delivery.wakes_at(m.membership_id)
+            out.append(
+                dataclasses.replace(
+                    m, board_why=board, version_claim=version, tools_claim=tools, wakes_at=wakes
+                )
+            )
         return out
 
     def member_detail(self, room_name: str, name: str) -> dict[str, Any]:
@@ -1111,6 +1186,8 @@ class RoomService:
             self.post_notice(room, w, level="warn")
         if result.room_changed:
             self.hub.room_settings(room.name, self.settings(room))
+        if result.pins_changed:
+            self.hub.pins(room.name, self.pins_payload(room))
         if result.members_changed or result.room_changed:
             self.hub.members_changed(room.name)
         if self.delivery is not None and result.event:

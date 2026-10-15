@@ -460,7 +460,7 @@ class HelloMiddleware(Middleware):
 
 
 # Every tool build_server registers, as mcp.hello reports them (#249); a test pins the two equal.
-TOOL_NAMES = ("join", "leave", "who", "say", "read", "wait", "pass", "away", "review", "status")
+TOOL_NAMES = ("join", "leave", "who", "claim", "say", "read", "wait", "pass", "away", "review", "status")
 
 
 def build_server(st: McpState) -> FastMCP:
@@ -534,6 +534,19 @@ def build_server(st: McpState) -> FastMCP:
         return dumps(res)
 
     @mcp.tool(annotations=RW)
+    async def claim(room: str, key: str, ttl: int, ctx: Context) -> str:
+        """Claim outside work for ttl; 0 releases."""
+        await st.prime(ctx)
+        tid = st.thread_id(ctx)
+        got = await st.find_cred(room, tid)
+        if isinstance(got, str):
+            return got
+        name, cred = got
+        res = await st.call("agent.claim", {**st.base(cred, tid), "key": key, "ttl": ttl})
+        st.forget(res, (tid, name))
+        return dumps(res)
+
+    @mcp.tool(annotations=RW)
     async def say(room: str, text: str, ctx: Context, reply_to: int = 0, since: int = -1) -> str:
         """Post a message; returns earlier unread messages. since=<last id seen>: refused, with
         the newer chat, if any. Markdown renders; no raw HTML or images."""
@@ -569,11 +582,15 @@ def build_server(st: McpState) -> FastMCP:
         reason: str = "",
         options: list[str] = EMPTY_OPTIONS,
         recommend: int = -1,
+        state: str = "",
+        threads: int = -1,
+        ci: str = "",
     ) -> str:
-        """The review board for one pull request. action: open(url, head), show,
+        """One pull request's review board. action: open(url, head), show,
         raise(title, detail, where="path:40-58"), ask(title, options, recommend),
-        concede(item, owner), contest or drop(item, reason), fix(item, commit, proof: test name
-        or link), confirm(item) by its raiser. Returns the board."""
+        concede(item, owner), contest/drop(item, reason), defer(item, reason=ticket),
+        fix(item, commit, proof: test name or link), confirm(item) by its raiser,
+        report(state, threads, ci) as gh/glab shows the PR."""
         await st.prime(ctx)
         tid = st.thread_id(ctx)
         got = await st.find_cred(room, tid)
@@ -596,6 +613,12 @@ def build_server(st: McpState) -> FastMCP:
         params = {**st.base(cred, tid), "action": action, **{k: v for k, v in given.items() if v}}
         if recommend != -1:
             params["recommend"] = recommend
+        if state:
+            params["state"] = state
+        if threads != -1:
+            params["threads"] = threads
+        if ci:
+            params["ci"] = ci
         res = await st.call("agent.review", params)
         st.forget(res, (tid, name))
         return dumps(res)

@@ -22,6 +22,7 @@ MAX_DETAIL = 4000
 MAX_FILE = 300
 MAX_LINES = 40
 MAX_REASON = 500
+MAX_TICKET = 200  # a follow-up ticket's key or link, for a deferred finding (#371)
 MAX_PROOF = 500
 MAX_OPTION = 200
 MAX_OPTIONS = 4
@@ -49,21 +50,33 @@ OPEN_FINDING = frozenset({"raised", "contested", "conceded"})
 # An agent's moves on a finding, from -> to. A person may also rule on a contested finding
 # (to conceded, with an owner, or to dropped) and drop anything; only a person answers.
 AGENT_MOVES = {
-    "concede": (frozenset({"raised", "contested"}), "conceded"),
+    # from conceded: a handover by its owner, or a takeover once the owner has left (#371)
+    "concede": (frozenset({"raised", "contested", "conceded"}), "conceded"),
     "contest": (frozenset({"raised"}), "contested"),
     "fix": (frozenset({"conceded"}), "fixed"),
     "drop": (frozenset({"raised", "contested", "conceded"}), "dropped"),
     "confirm": (frozenset({"fixed"}), "fixed"),
+    # to a follow-up ticket: settled for this pull request, stored as dropped with the ticket (#371)
+    "defer": (frozenset({"raised", "contested", "conceded"}), "dropped"),
 }
 PERSON_MOVES = {
-    "concede": (frozenset({"raised", "contested"}), "conceded"),
+    # from conceded: a person reassigns its owner (#371)
+    "concede": (frozenset({"raised", "contested", "conceded"}), "conceded"),
     "drop": (frozenset({"raised", "contested", "conceded", "open"}), "dropped"),
     "answer": (frozenset({"open"}), "answered"),
+    # a person's ruling that it's fixed, and so settled: confirmed by them (#371)
+    "fix": (frozenset({"conceded"}), "fixed"),
+    "defer": (frozenset({"raised", "contested", "conceded"}), "dropped"),
 }
 
 
 class ReviewError(ValueError):
     """A move that isn't allowed, or input that doesn't fit. The message is for the caller."""
+
+
+class ProofRequired(ReviewError):
+    """A fix came without its proof (#251). Its own class so the agent service can tell a session
+    whose ``review`` tool has no ``proof`` field to update, not to send one (#340)."""
 
 
 @dataclass(frozen=True)
@@ -88,6 +101,9 @@ class Item:
     updated_at: float = 0.0
     proof: str = ""
     confirmed_by: str = ""
+    outdated_head: str = ""
+    # a dropped finding deferred to this follow-up ticket (#371): settled, but not withdrawn
+    deferred_to: str = ""
 
     @property
     def label(self) -> str:
@@ -125,10 +141,62 @@ def url(value: Any) -> str:
 
 def proof(value: Any) -> str:
     """A test's name or an http(s) proof link; the broker checks shape, not its contents."""
-    p = text(value, "proof", MAX_PROOF, required=True)
+    p = text(value, "proof", MAX_PROOF)
+    if not p:
+        raise ProofRequired("proof is required")
     if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", p) and not URL_RE.fullmatch(p):
         raise ReviewError("proof link must be an http(s) URL, or give the test's name")
     return p
+
+
+# What an agent reads off the pull request with its own gh or glab and reports (#291, §37.11):
+# switchboard holds no token and polls no forge, so these are the reporting agent's claims, shown
+# as theirs. A value it doesn't know is refused, never taken for one it does.
+PR_STATES = ("open", "merged", "closed")
+CI_STATES = ("passing", "failing", "running", "none")
+MAX_THREADS = 999
+
+
+def report(params: dict[str, Any]) -> dict[str, Any]:
+    """A report's checked fields (``pr_state``, ``pr_threads``, ``pr_ci``, the ones given), or
+    ReviewError: at least one, each from its list or a count from 0 to 999."""
+    out: dict[str, Any] = {}
+    state = params.get("state")
+    if state not in (None, ""):
+        if state not in PR_STATES:
+            raise ReviewError(f"state must be one of: {', '.join(PR_STATES)}")
+        out["pr_state"] = state
+    threads = params.get("threads")
+    if threads not in (None, -1):
+        if type(threads) is not int or not 0 <= threads <= MAX_THREADS:
+            raise ReviewError(f"threads must be the count of unresolved threads, 0 to {MAX_THREADS}")
+        out["pr_threads"] = threads
+    ci = params.get("ci")
+    if ci not in (None, ""):
+        if ci not in CI_STATES:
+            raise ReviewError(f"ci must be one of: {', '.join(CI_STATES)}")
+        out["pr_ci"] = ci
+    if not out:
+        raise ReviewError("report needs state, threads or ci, as gh or glab shows them")
+    return out
+
+
+def report_line(review: dict[str, Any], now: float) -> str:
+    """The latest report, as the agent and the page read it: "2 open on the PR, CI failing (per
+    claude-1, 3 min ago)". Empty when no agent has reported."""
+    if not review.get("reported_by"):
+        return ""
+    bits = []
+    if review.get("pr_state") in ("merged", "closed"):
+        bits.append(str(review["pr_state"]))
+    if review.get("pr_threads") is not None:
+        n = int(review["pr_threads"])
+        bits.append(f"{n} open on the PR" if n else "no threads open on the PR")
+    if review.get("pr_ci"):
+        bits.append(f"CI {review['pr_ci']}")
+    mins = max(0, int((now - float(review.get("reported_at") or now)) // 60))
+    age = "just now" if mins == 0 else f"{mins} min ago" if mins < 120 else f"{mins // 60} h ago"
+    return f"{', '.join(bits) or review.get('pr_state') or 'reported'} (per {review['reported_by']}, {age})"
 
 
 def head(value: Any) -> str:
@@ -233,10 +301,12 @@ def commit_url(f: dict[str, Any] | None, sha: str) -> str | None:
 # what each move a board records reads as on a card's history (#250)
 HISTORY_VERBS = {
     "conceded": "conceded it",
+    "reassigned": "reassigned it",
     "contested": "contested it",
     "fixed": "fixed it",
     "confirmed": "confirmed it",
     "dropped": "dropped it",
+    "deferred": "deferred it to a ticket",
     "answered": "answered it",
 }
 MAX_HISTORY = 12
@@ -284,10 +354,13 @@ def parse_label(value: Any) -> tuple[str, int]:
     return ("finding" if m.group(1) in "Ff" else "question"), int(m.group(2))
 
 
-def agent_move(item: Item, move: str, actor: str) -> str:
+def agent_move(item: Item, move: str, actor: str, owner_here: bool = True) -> str:
     """The state an agent's ``move`` takes ``item`` to, or ReviewError. Rules beyond the
     table: a question is a person's to answer or drop; whoever raised a finding can't concede
-    or contest it (that's the other side's call), only drop it; only its owner marks it fixed."""
+    or contest it (that's the other side's call), only drop it; only its owner marks it fixed.
+    A conceded finding moves to another owner (#371) when its owner hands it over, or when the
+    owner has left the room (``owner_here`` False: a restart brings an agent back under a new
+    name, and the finding would otherwise be no one's to fix)."""
     if move not in AGENT_MOVES:
         raise ReviewError(f"unknown move {move!r}")
     if item.kind == "question":
@@ -297,10 +370,19 @@ def agent_move(item: Item, move: str, actor: str) -> str:
         raise ReviewError(f"{item.label} is {item.state}: it can't be {to} from there")
     if move in ("concede", "contest") and actor == item.raised_by:
         raise ReviewError(f"{item.label} is yours: you can drop it, not {move} it")
+    if move == "concede" and item.state == "conceded" and actor != item.owner and owner_here:
+        raise ReviewError(
+            f"{item.label} is {item.owner}'s: {item.owner} can hand it over, or a person can reassign it"
+        )
     if move == "fix" and actor != item.owner:
+        if not owner_here:
+            raise ReviewError(
+                f"{item.label} is {item.owner}'s to fix, and {item.owner} isn't in the room: take it"
+                f' over first with review(action="concede", item="{item.label}")'
+            )
         raise ReviewError(f"{item.label} is {item.owner}'s to fix")
-    if move == "drop" and actor != item.raised_by:
-        raise ReviewError(f"only {item.raised_by}, who raised {item.label}, or a person can drop it")
+    if move in ("drop", "defer") and actor != item.raised_by:
+        raise ReviewError(f"only {item.raised_by}, who raised {item.label}, or a person can {move} it")
     if move == "confirm":
         if item.confirmed_by:
             raise ReviewError(f"{item.label} is already confirmed by {item.confirmed_by}")
@@ -354,6 +436,15 @@ def settled(items: list[Item]) -> bool:
     )
 
 
+def unsettled_finding_ids(items: list[Item]) -> list[int]:
+    """Findings whose lines or fix still need checking after the board moves to a new head."""
+    return [
+        i.id
+        for i in items
+        if i.kind == "finding" and (i.state in OPEN_FINDING or (i.state == "fixed" and not i.confirmed_by))
+    ]
+
+
 def needs_person(item: Item, active: set[str] | None = None, now: float | None = None) -> bool:
     """A fix waits for a person's check when its independent raiser cannot confirm in time."""
     if item.needs_person:
@@ -380,7 +471,7 @@ def counts(items: list[Item], active: set[str] | None = None, now: float | None 
     return out
 
 
-def render(review: dict[str, Any], items: list[Item]) -> str:
+def render(review: dict[str, Any], items: list[Item], now: float | None = None) -> str:
     """The board as an agent reads it: one line per item, open work first. Short on purpose:
     the board replaces a wall of text in the room, it mustn't become one."""
     head_s = f" at {review['head'][:12]}" if review.get("head") else ""
@@ -388,6 +479,9 @@ def render(review: dict[str, Any], items: list[Item]) -> str:
     if review.get("posted_by"):
         state = f"handed off to {review['posted_by']}: post one review now, once"
     out = [f"Review of {review['url']}{head_s}: {state}"]
+    line = report_line(review, now if now is not None else float(review.get("reported_at") or 0))
+    if line:
+        out.append(f"The pull request: {line}")
     order = {
         s: n
         for n, s in enumerate(("contested", "open", "raised", "conceded", "answered", "fixed", "dropped"))
@@ -401,7 +495,9 @@ def render(review: dict[str, Any], items: list[Item]) -> str:
             "fixed": f"fixed by {i.owner}"
             + (f" in {i.commit[:12]}" if i.commit else "")
             + (f", confirmed by {i.confirmed_by}" if i.confirmed_by else ", awaiting confirmation"),
-            "dropped": "dropped" + (f": {i.reason}" if i.reason else ""),
+            "dropped": f"deferred to {i.deferred_to}"
+            if i.deferred_to
+            else "dropped" + (f": {i.reason}" if i.reason else ""),
             "open": "for a person: "
             + " | ".join(
                 f"{n}. {o}{' (recommended)' if n == i.recommend else ''}" for n, o in enumerate(i.options)
@@ -409,7 +505,8 @@ def render(review: dict[str, Any], items: list[Item]) -> str:
             "answered": f"answered by {i.answered_by}: {i.answer}",
         }[i.state]
         proof_s = f"; proof: {i.proof}" if i.state == "fixed" and i.proof else ""
-        out.append(f"{i.label} [{i.state}] {i.title}{where}: {who}{proof_s}")
+        outdated = f"; outdated at {i.outdated_head}" if i.outdated_head else ""
+        out.append(f"{i.label} [{i.state}] {i.title}{where}: {who}{proof_s}{outdated}")
     if review.get("posted_by") and review.get("plan"):
         plan = review["plan"]
         out.extend(("Handoff summary to post:", plan["summary"], "Line comments to leave open:"))
@@ -436,18 +533,23 @@ def handoff_plan(
     lines = ["Review board summary"]
     for i in done:
         if i.state == "fixed":
-            outcome = f"Fixed: {i.title} — commit {i.commit}"
+            # a person's own ruling has no agent's proof, and may have no commit either (#371)
+            outcome = f"Fixed: {i.title}" + (
+                f" — commit {i.commit}" if i.commit else f", on {i.confirmed_by}'s say"
+            )
             if i.proof:
                 outcome += f"; proof: {i.proof}"
         elif i.state == "answered":
             outcome = f"Answered: {i.title} — {i.answer}"
+        elif i.deferred_to:
+            outcome = f"Deferred: {i.title} — to {i.deferred_to}"
         else:
             outcome = f"Dropped: {i.title}" + (f" — {i.reason}" if i.reason else "")
         lines.append(f"- {i.label} {outcome}")
     decisions: dict[str, list[str]] = {}
     for event in events:
         data = event.get("data") or {}
-        if data.get("to") not in ("conceded", "dropped", "confirmed"):
+        if data.get("to") not in ("conceded", "dropped", "confirmed", "deferred"):
             continue
         label, actor = data.get("item"), data.get("by")
         if not isinstance(label, str) or not isinstance(actor, str):
@@ -461,9 +563,18 @@ def handoff_plan(
     for i in done:
         if i.kind != "finding" or not i.file or not i.lines or i.label not in decisions:
             continue
-        result = (
+        fixed = (
             f"Fixed in {i.commit}; proof: {i.proof}."
+            if i.proof
+            else f"Fixed in {i.commit}, on {i.confirmed_by}'s say."  # a person's ruling (#371)
+            if i.commit
+            else f"Fixed, on {i.confirmed_by}'s say."
+        )
+        result = (
+            fixed
             if i.state == "fixed"
+            else f"Deferred to {i.deferred_to}."
+            if i.deferred_to
             else f"Dropped: {i.reason}."
             if i.state == "dropped"
             else ""

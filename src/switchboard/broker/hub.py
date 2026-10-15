@@ -67,9 +67,10 @@ class Subscriber:
 class WsSubscriber(Subscriber):
     """A browser WebSocket. Frames are the §5.5 server->client shapes, plus ``remotes``:
     every remote link's state, for the header chips and the remotes panel (§27.11), and
-    ``machines``: every machine that dials in (§31.7)."""
+    ``machines``: every machine that dials in (§31.7), ``people``: everyone on a hosted
+    broker and who has a page open (§44.8), and ``pins``: a room's pinned decisions (§48)."""
 
-    kinds: frozenset[str] = Subscriber.kinds | {"remotes", "machines", "review"}
+    kinds: frozenset[str] = Subscriber.kinds | {"remotes", "machines", "review", "people", "pins"}
 
     def __init__(self) -> None:
         super().__init__()
@@ -78,7 +79,7 @@ class WsSubscriber(Subscriber):
         self.person: int | None = None  # whose page (0: the owner), for private rooms (§44)
 
     def format(self, kind: str, room: str | None, data: dict[str, Any]) -> Any:
-        if kind in ("rooms", "remotes", "machines"):
+        if kind in ("rooms", "remotes", "machines", "people"):
             return {"t": kind, **data}
         return {"t": kind, "room": room, **data}
 
@@ -115,6 +116,14 @@ class Hub:
     def ws_count(self) -> int:
         return sum(1 for s in self.subs if isinstance(s, WsSubscriber) and not s.closed)
 
+    def online_persons(self) -> set[int]:
+        """Whose pages are open now (0: the owner), for the People list (§44.8)."""
+        return {
+            s.person
+            for s in self.subs
+            if isinstance(s, WsSubscriber) and not s.closed and s.person is not None
+        }
+
     # publishing ------------------------------------------------------------
     def publish(self, kind: str, room: str | None, data: dict[str, Any]) -> int:
         n = 0
@@ -139,6 +148,10 @@ class Hub:
         """A room's review board after a move, or None once it's closed (§37.5); the web UI
         subscribes to it."""
         return self.publish("review", room, {"board": board})
+
+    def pins(self, room: str, pins: list[dict[str, Any]]) -> int:
+        """A room's pinned messages after a pin or an unpin (§48); the web UI subscribes to it."""
+        return self.publish("pins", room, {"pins": pins})
 
     def unsubscribe_person(self, room: str, person: int) -> None:
         """A person left a private room (§44): their pages stop getting its frames at once."""

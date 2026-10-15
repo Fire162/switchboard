@@ -57,14 +57,14 @@ flowchart TB
 | **Web UI**<br>`web/static/` | Plain JavaScript. Writes go over REST, live updates over a read-only WebSocket; Markdown becomes DOM nodes, never HTML strings. | [§29](DESIGN.md#29-the-native-web-ui-and-the-inspector-19), [§5.5](DESIGN.md#55-rest-and-websocket) |
 | **Remote links**<br>`broker/remote.py`, `broker/machines.py`, `remote/` | One link per other machine: the broker dials it over SSH (`switchboard satellite` at the far end), or it dials a hosted broker over `wss://`. The far end vouches for that machine's processes, and the broker trusts it for that machine's members only. | [§27](DESIGN.md#27-remote-members-over-ssh-m8), [§31.7](DESIGN.md#317-the-dial-in-link) |
 
-Also: `cli.py`; `install/` ([§9.7](DESIGN.md#97-install-targets-switchboard-install-h)); `envelope.py` ([§8.6](DESIGN.md#86-envelope-enveloperender_batchitems-header_ctx-peer_inline)); `store.py`, `db.py` and `models.py` ([§4](DESIGN.md#4-data-model-sqlite)); `guardrails.py` ([§11](DESIGN.md#11-security-model)).
+Also: `cli.py`; `install/` ([§9.7](DESIGN.md#97-install-targets-switchboard-install-h)); `envelope.py` ([§8.6](DESIGN.md#86-envelope-enveloperender_batchitems-header_ctx-peer_inline)); `claims.py` ([§47](DESIGN.md#47-advisory-claims-for-work-outside-a-room-293)); `store.py`, `db.py` and `models.py` ([§4](DESIGN.md#4-data-model-sqlite)); `guardrails.py` ([§11](DESIGN.md#11-security-model)).
 
 ## The path of a message
 
 1. **Posted** in the web UI (`web.py`), with `switchboard say`, or by an agent's `say` through its MCP server and the socket.
 2. **Stored and classified** in one transaction: the message, and a delivery row for each other member with its priority (a person, an @mention, or chatter) ([§8.1](DESIGN.md#81-classification-on-insert-in-the-same-transaction-as-the-message)).
 3. **Fanned out** by the hub to browsers and `tail`.
-4. **Decided per recipient.** `rules.releasable` says whether anything can go now (nothing in a paused room or to a held member, no wake past the budget unless a person wrote, priority only to a busy agent), the adapter's `route()` says how, and the engine returns an action ([§8.2](DESIGN.md#82-engine-core-and-runner)).
+4. **Decided per recipient.** `rules.releasable` says whether anything can go now (nothing in a paused room or to a held member, no wake past the budget unless a person wrote, priority only to a busy agent, other agents' chatter held a few minutes unless it addresses the recipient), the adapter's `route()` says how, and the engine returns an action ([§8.2](DESIGN.md#82-engine-core-and-runner)).
 5. **Delivered** by the runner through the adapter, or by the agent's hook at its next tool call, or at its next `read()`, `wait()` or `say()`.
 6. **Confirmed** only by evidence from the session that got it, such as the batch token in its next hook, or back to pending: duplicates are possible, skips are not ([§8.7](DESIGN.md#87-offers-confirmation-and-expiry-two-phase-ack-event-based)).
 7. **Answered** with `say()`, back to step 1, or `pass()`.
@@ -76,7 +76,7 @@ All along, hooks report each session's state, and nothing is delivered to a sess
 From [CLAUDE.md](../CLAUDE.md). Each rule keeps some part easy to test or to change.
 
 - **SQL only in `store.py`,** with the schema, migrations and connection helpers in `db.py`: one file changes with the schema, and the store's tests run every query.
-- **Policy pure in `rules.py`:** no store, clock or I/O, so each rule has a plain unit test.
+- **Policy pure in `rules.py` and `claims.py`:** no store, clock or I/O, so each rule has a plain unit test.
 - **The engine synchronous:** it reads the store and a clock and returns actions, with no `await` and no network or process I/O, so every rule runs under a `FakeClock` and `tests/engine_sim.py` drives it through 200 seeds.
 - **Each harness's quirks in its own adapter:** the engine and broker ask the adapter rather than check the harness, so changing a harness touches one module. `tests/unit/test_engine_names_no_harness.py` holds the engine to it.
 - **The hook standalone:** standard library only, nothing from switchboard, every path exits 0, because a failed import or a non-zero exit could block the harness's prompt.
@@ -86,7 +86,7 @@ Beside these is the [security model](../CLAUDE.md#the-security-model-in-short) (
 
 ### Where the code doesn't follow them yet
 
-Each is an open issue; don't copy the pattern, and the fix removes its mention here. Harness branches outside the adapters: `agents.py`'s `mcp.hello`/attach branches ([#170](https://github.com/amahpour/switchboard/issues/170); Codex session keys and binding and the Cursor branches moved to their adapters).
+None now: #170 and #360 moved the last harness branches out of `agents.py` into the adapters, and `tests/unit/test_adapter_hello_attach.py` keeps the methods they left clean. When one turns up, it is an open issue and is listed here, so nobody copies the pattern, until its fix removes the mention.
 
 ## Where to read next in DESIGN.md
 

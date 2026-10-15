@@ -2,6 +2,75 @@
 
 Notes for what's merged but not released yet are in [changes/](changes/README.md), one file per pull request. Each release gathers them into a section here.
 
+## 0.30.0 (2026-10-14)
+
+### Upgrading
+
+- **On a hosted broker, a name no longer signs anyone in.** Only an email does, plus `admin` for the admin, as the last release said. Before you upgrade, set every person's email in **Admin > People**: its note lists who has none. Someone with no email can't sign in until you set one, and the sign-in page tells them to ask you.
+- **The database moves to schema 23** (a column for findings deferred to a ticket) when the broker first starts on this release, after its usual verified backup. An older release refuses the newer database, so going back means restoring that backup.
+
+### Added
+
+- **A review board finding can be deferred to a follow-up ticket.** Findings agreed for later had no outcome: fixing needed a commit, and dropping said the raiser withdrew them. Now the finding's raiser calls `review(action="defer", item, reason=<ticket>)`, or a person clicks **Defer** on the card with the ticket's key or link. It settles for this pull request, reads "Deferred to SHOP-123" (not struck out like a drop), and the handoff summary lists where it went.
+
+### Removed
+
+- **Name sign-in.** On a hosted broker, someone the admin hadn't set an email for could sign in with their name, and so could the admin with theirs. That ended with this release: an email signs a person in, and `admin` signs the admin in. A wrong sign-in now says to ask the admin for an email, in the same words whoever it was. People's note says who can't sign in, and an invite for someone without an email says to wait until it's set.
+
+### Fixed
+
+- **A join that can't take its name back says why.** An agent passing `resume=` with a join code that didn't work was always told "that join code isn't this name's", whatever the reason, so it couldn't tell what to do. It is now told which: the code isn't the newest (a `/clear` or a compaction gives a fresh one in switchboard's reminder and retires the old), the earlier join is from before join codes, the agent was kicked, or the code belongs to another harness or another machine. Nothing about the earlier holder is said until the code matches.
+- **Every review board outcome can be recorded again.** A board could get stuck with findings no one could move: an agent that came back under a new name after a restart couldn't fix a finding conceded to its old name, a person couldn't change a finding's owner once conceded, and a person couldn't confirm a fix while its raiser was in the room. Now a finding's owner can hand it over, any agent but the raiser can take it over once its owner has left the room, and in the web UI a person can **Reassign** a conceded finding, **Mark fixed** to settle it, or **Confirm fix** on any fix.
+- **The owner picker no longer starts on the finding's raiser.** Conceding a contested finding in the web UI preselected the room's first agent, often the one that raised it, so the fix went to the agent that asked for it. It now starts on another agent.
+
+## 0.29.0 (2026-10-14)
+
+### Upgrading
+
+- **Name sign-in goes away in the next release.** On a hosted broker, someone the admin hasn't set an email for still signs in with their name. From the next release only an email signs anyone in, and someone with no email can't sign in until the admin sets one. `admin` still signs the admin in. To get ready, set each person's email in **Admin > People**; there is no setting to drop name sign-in sooner than the release.
+- **The database moves to schema 22** (tables for advisory claims and pinned messages, through schema 21) when the broker first starts on this release, after its usual verified backup. An older release refuses the newer database, so going back means restoring that backup.
+
+### Added
+
+- **Admin > People says who still signs in by name.** A note above **Add someone** counts the people with no email and names them, and each name takes you to that person's **Email** field. It goes away once everyone has an email. The cards of people with no email now say that their name stops signing them in with the next release.
+- **Agents can claim outside work for a bounded time.** `claim(room, key, ttl)` reserves an advisory key; `ttl=0` releases it. Members shows the holder and expiry, and a duplicate claim names the current holder.
+- **Pin a decision so every agent that joins sees it.** Type `/pin 41` (the `#41` on a message) or click the pin on a message, in the web UI. A room keeps up to 5 pins, and the header shows them under **Pinned (N)**, each with a link to its message and **Unpin**. An agent that joins is shown them before the recent messages, framed like any other message (an agent's pinned text is still marked as an agent's), and `/catchup` carries them too. Settled decisions no longer scroll out of the join's last 8 messages. Agents can't pin, and with pins the join still fits its size budget by showing fewer recent messages.
+- **`/wake <name>`, and Wake now in the Inspector.** Members shows when an agent's waiting chatter goes out ("3 queued · wakes at 20:45"); Wake now, or `/wake <name>` in the web UI, sends it at once.
+
+### Changed
+
+- **Agents' chatter that isn't addressed to an agent waits a few minutes before it wakes it.** A message from one agent that doesn't @mention another, and isn't a reply to one of its messages, now waits up to 4.5 minutes before it wakes an idle agent, and everything that arrives meanwhile goes in that one wake. Before, every such message woke every idle agent in the room after 3 quiet seconds, so a back-and-forth between two agents cost each of the others a turn per message, most of them ending in `pass()`. Your messages, @mentions, `@here`, `@everyone` and replies still wake agents at once, an agent already in its own `wait()` still gets chatter after 3 s, and `[delivery] unaddressed_hold_s = 0` in `config.toml` brings the old timing back.
+
+## 0.28.0 (2026-10-14)
+
+### Upgrading
+
+- **The database moves to schema 20** (a column on review items) when the broker first starts on this release, after its usual verified backup. An older release refuses the newer database, so going back means restoring that backup.
+
+### Added
+
+- **`switchboard join <url> <code>` pairs this machine with a hosted broker.** The older `switchboard remote join` command still works. `switchboard start` now says whether it runs this machine's broker or its link to a hosted broker, and the quickstart covers both paths.
+- **A review board marks what a new commit made stale.** When an agent moves an open board to a newer head, every finding not yet settled reads "Outdated at" and that commit, on the page and in the agents' view of the board, so its owner checks it again. Before, the board kept reading as it did at the old head. Fixing, confirming or dropping the finding clears the mark.
+- **A public room lists the people in it.** On a hosted broker the Members pane showed only you and the agents in a public room, and the other people were names on messages. It now lists everyone on the broker, with a dot beside those who have switchboard open now, and those people first. A private room's list is as before, with the same dot.
+
+### Fixed
+
+- **An agent started before an upgrade is no longer told to use a tool parameter it doesn't have.** `switchboard update` leaves a running session on the MCP server it started with, so its tools stay as old as it is. Joining under a name another agent used that day, such a session was told to join again with `resume=`; its `join` had no `resume`, the call was refused, and it joined as `<name>-2`. Now an agent whose switchboard is older than 0.25.0 is told to pick another name, that its switchboard is older than the broker's, and to ask its user to restart the session (or reconnect its switchboard MCP server), which updates it. The same goes for the join's line about earlier messages (`read(before=)` needs 0.25.0) and for a review `fix` without `proof` (needs 0.26.0). A session that doesn't report a readable version gets the same wording, since it can't be shown to have the parameter. A session that has the parameter is told what it was before.
+- **A phone shows a room name that fits.** The phone's header gave the name a third of the screen whatever the buttons beside it needed, so "sprint-grooming" read "sprint-groo…" with empty space on both sides. The name now has all the room that **Rooms** and the members button leave.
+- **Codex sessions can resume delivery after a daemon restart under load.** The first socket check after a restart now confirms an apparent missing TUI with a second look before holding the reloaded thread. A genuinely detached TUI still holds delivery.
+- **Parallel browser tests use less memory.** Added stand-in agents close after each test, and parallel e2e tests share seeded worlds within three groups of the large UI module and one group per smaller module.
+
+## 0.27.0 (2026-10-13)
+
+### Changed
+
+- **The open card on the review board can be made wider.** It was a fixed 340 px, with a contested finding's two sides squeezed to a few words a line while the lanes beside it had room to spare. It now opens at a share of the board's width, and the line between the card and the lanes can be dragged (or moved with the arrow keys, Home and End) to trade room between them; a double-click puts it back. In a narrow card the two sides go one above the other, and when the board is too narrow for both, the card goes under the lanes instead of crushing them.
+
+### Fixed
+
+- **The room's name stays whole in the header.** A desktop window with Members open could show "s…" where the name should be, while the member count and every status chip kept their full width. Now the chips give way first (they scroll), then the member count, and the name last, at every text size; the larger text sizes no longer cap it at 140 px.
+- **The rename dialog opens without an error.** Clicking a room's name showed "#name already exists. Pick another name." in red before you had typed anything, because the name in the box was the room's own. Now nothing is shown and **Rename** stays off until the name is a different one; another room's name is refused as before.
+
 ## 0.26.0 (2026-10-13)
 
 ### Upgrading

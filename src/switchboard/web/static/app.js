@@ -55,6 +55,7 @@
     // name -> { name, slug, id, createdAt, lastId, msgs: [], members: [], settings: {},
     //           unread: 0 (addressed to me: the red count), quiet: false (other new agent chat) }
     rooms: new Map(),
+    pinsOpen: false,   // the header's pinned list is open (#292)
     closed: 0,         // how many closed rooms there are (GET /api/rooms), for the Closed row
     closedRooms: [],   // GET /api/closed-rooms, as the Closed sheet shows it
     active: null,
@@ -83,6 +84,10 @@
     sheetOpener: null, // the control that opened the Closed, Remotes or Passkeys sheet (focus returns to it)
     passkeyBusy: false, // an Add a passkey ceremony is under way
     boardOpen: false,  // the active room's review board is shown instead of its log (#80)
+    everyone: [],        // every person on a hosted broker, from the `people` frame (#354); empty on a desktop
+    online: new Set(),   // those of them with a page open now
+    peopleAll: false,    // a long People list is shown whole
+    boardDetailW: null,  // the open card's width, set with its divider (#343): a step, 'max', or null (its share)
     boardSel: null,    // the label of the board card whose detail is open
     // Focus mode (#99): collapse agent chat not addressed to you. In memory only: no existing
     // preference fits a plain on/off toggle, and the lint bans browser storage for a new one
@@ -192,10 +197,15 @@
             const value = String(name.value || '').trim().toLowerCase();
             const room = value.startsWith('#') ? value : '#' + value;
             const valid = /^#[a-z0-9][a-z0-9_-]{0,31}$/.test(room);
+            // Renaming: the name the dialog opens with is taken, by this room. That is nothing to
+            // warn about (it said "already exists" before anyone had typed, #334) and nothing
+            // to save, so Rename waits for a different name.
+            const same = options.kind === 'rename' && room === String(options.initial || '').toLowerCase();
+            const taken = !same && state.rooms.has(room);
             error.textContent = !value ? '' : !valid
               ? 'Use a name like #build: letters, numbers, _ or -, up to 32 characters.'
-              : state.rooms.has(room) ? room + ' already exists. Pick another name.' : '';
-            action.disabled = !valid || state.rooms.has(room);
+              : taken ? room + ' already exists. Pick another name.' : '';
+            action.disabled = !valid || taken || same;
             return action.disabled ? null : room;
           };
         }
@@ -487,6 +497,8 @@
     pause: 'M5.5 3.5v9M10.5 3.5v9',
     play: 'M5 3.5v9l7-4.5-7-4.5Z',
     sidebar: rr(2, 3, 12, 10, 2) + 'M10 3v10',
+    // a thumbtack, for a pinned message (#292)
+    pin: 'M5.5 2.5h5M6.3 2.5l-.4 4L4 8.3v.7h8v-.7l-1.9-1.8-.4-4M8 9v4.5',
     people: circ(6, 5, 2.5) + 'M1.5 13.5c.4-2.4 2.3-3.8 4.5-3.8s4.1 1.4 4.5 3.8M10.5 2.7a2.5 2.5 0 0 1 0 4.6M12 9.9c1.4.5 2.3 1.7 2.5 3.6',
     at: circ(8, 8, 2.5) + 'M10.5 8v1a2 2 0 0 0 4 0V8a6.5 6.5 0 1 0-2.6 5.2',
     slash: rr(2, 2, 12, 12, 3) + 'M9.8 5 6.2 11',
@@ -498,6 +510,8 @@
     door: 'M3.5 14V2.5h8V14M1.5 14h13M9 8.5h.01',
     info: circ(8, 8, 6) + 'M8 7.3V11M8 5h.01',
     warn: 'M8 2.3 14.6 13.6H1.4L8 2.3ZM8 6.6v3.2M8 11.8h.01',
+    // a bell, for Wake now (#137): the body, the rim and the clapper
+    bell: 'M4.5 11V7a3.5 3.5 0 0 1 7 0v4l1.5 1.5h-10L4.5 11ZM6.5 13.5a1.5 1.5 0 0 0 3 0',
     hourglass: 'M4.5 2.5h7M4.5 13.5h7M5.5 2.5c0 3 5 3 5 5.5s-5 2.5-5 5.5M10.5 2.5c0 3-5 3-5 5.5s5 2.5 5 5.5',
     history: 'M2.5 8a5.5 5.5 0 1 0 1.7-4M2.5 2.5V5.5h3M8 5.5V8l2 1.5',
     kick: circ(6.5, 5, 2.5) + 'M1.5 13.5c.4-2.4 2.3-3.8 5-3.8 1.2 0 2.2.3 3 .8M11 10l3.5 3.5M14.5 10 11 13.5',
@@ -575,7 +589,7 @@
     let r = state.rooms.get(name);
     if (!r) {
       r = { name: name, slug: name.replace(/^#/, ''), lastId: 0, msgs: [], members: [], settings: {}, rules: '',
-        unread: 0, quiet: false };
+        pins: [], unread: 0, quiet: false };
       state.rooms.set(name, r);
     }
     return r;
@@ -786,6 +800,108 @@
     return meta;
   }
 
+  // ----------------------------------------------------------- pinned decisions (#292, §48)
+  // A person pins a chat message: every agent that joins is shown it, and the room's header lists
+  // it. The button is the same as typing /pin <id>, and goes through it, so the broker's rules
+  // (a person's web session, at most five) are the only ones. The buttons and the strip follow the
+  // broker's `pins` frames, never what a click expects.
+  function isPinned(r, id) {
+    return !!r && Array.isArray(r.pins) && r.pins.some(function (p) { return p.id === id; });
+  }
+
+  // aria-pressed says which; the label stays one thing, so a screen reader doesn't hear both
+  function setPinState(b, on, id) {
+    b.setAttribute('aria-pressed', String(on));
+    b.title = on ? 'Pinned: click to unpin' : 'Pin: agents that join are shown it first';
+    b.dataset.pin = String(id);
+  }
+
+  // a chat row's pin button (the last thing in the row, out of the grid: style.css) and its mark
+  function withPin(line, r, m) {
+    line.classList.toggle('is-pinned', isPinned(r, m.id));
+    line.append(pinButton(r, m.id));
+    return line;
+  }
+
+  function pinButton(r, id) {
+    const b = btn('msg-pin');
+    b.setAttribute('aria-label', 'Pin message ' + id);
+    b.append(icon('pin'));
+    setPinState(b, isPinned(r, id), id);
+    b.addEventListener('click', function () {
+      setPinned(r, id, b.getAttribute('aria-pressed') !== 'true');
+    });
+    return b;
+  }
+
+  async function setPinned(r, id, on) {
+    try {
+      await api('POST', '/api/rooms/' + encodeURIComponent(r.slug) + '/command', { text: (on ? '/pin ' : '/unpin ') + id });
+    } catch (e) {
+      renderLocal(String(e.message || e), true);  // a sixth pin says to unpin one first
+    }
+  }
+
+  // the rows on screen, after the room's pins changed: in place, so focus stays where it is
+  function markPinned(r) {
+    for (const row of $('log').children) {
+      if (!row.classList || !row.classList.contains('k-chat')) continue;
+      const id = Number(row.dataset.id);
+      row.classList.toggle('is-pinned', isPinned(r, id));
+      for (const b of row.children) {
+        if (b.classList && b.classList.contains('msg-pin')) setPinState(b, isPinned(r, id), id);
+      }
+    }
+  }
+
+  // the room's pins in the header: a count and the newest pin on one line, opened to a list of
+  // each with a link to its message and Unpin. A pin's text is the sender's: textContent only.
+  function renderPins() {
+    const r = activeRoom();
+    const box = $('pins');
+    const pins = r && Array.isArray(r.pins) ? r.pins : [];
+    const focused = focusKey(box);
+    box.classList.toggle('hidden', pins.length === 0);
+    const list = $('pins-list');
+    list.replaceChildren();
+    if (!pins.length) {
+      if (focused) tryFocus($('input'));
+      return;
+    }
+    const open = !!state.pinsOpen;
+    const toggle = $('pins-toggle');
+    toggle.setAttribute('aria-expanded', String(open));
+    $('pins-count').textContent = 'Pinned (' + pins.length + ')';
+    const newest = pins[pins.length - 1];
+    $('pins-peek').textContent = label(newest.from, newest.host) + ': ' + firstLine(newest.text, 100);
+    list.classList.toggle('hidden', !open);
+    for (const p of pins) {
+      const li = el('li', 'pin-row');
+      li.dataset.id = String(p.id);
+      const who = label(p.from, p.host);
+      const link = btn('pin-link');
+      link.dataset.focus = 'pin-link:' + p.id;
+      const snippet = firstLine(p.text, 160);
+      link.append(avatar(p.harness, p.sender_kind, p.from, 'mini'), el('span', 'pin-from', who), el('span', 'pin-text', snippet));
+      link.setAttribute('aria-label', 'Go to message ' + p.id + ' from ' + who + ': ' + snippet);
+      link.title = p.text + (p.cut ? '…' : '') + '\n#' + p.id + ' · pinned by ' + p.pinned_by;
+      link.addEventListener('click', function () { jumpToPin(r, p.id); });
+      const un = btn('btn btn-ghost-sm pin-unpin', 'Unpin');
+      un.dataset.focus = 'pin-unpin:' + p.id;
+      un.setAttribute('aria-label', 'Unpin message ' + p.id);
+      un.addEventListener('click', function () { setPinned(r, p.id, false); });
+      li.append(link, un);
+      list.append(li);
+    }
+    // an Unpin that took its row with it hands the focus to the strip's own button
+    if (focused && !refocus(box, focused) && !refocus(box, 'pins-toggle')) tryFocus(toggle);
+  }
+
+  function jumpToPin(r, id) {
+    if ($('log').querySelector('[data-id="' + String(id) + '"]')) jumpTo(id);
+    else renderLocal('Message #' + id + ' is older than the history this page has loaded.');
+  }
+
   function inspectedLabel() {
     const ins = state.inspect;
     if (!ins || ins.room !== state.active) return null;
@@ -878,7 +994,7 @@
     if (isCont(prev, m)) {
       line.classList.add('cont');
       line.append(messageMeta(m, true), mdBody(m.text, m.mentions));
-      return line;
+      return withPin(line, r, m);
     }
     const reply = m.reply_to ? replyLine(r, m) : null;
     if (reply) {
@@ -908,7 +1024,7 @@
     head.append(messageMeta(m, false));
     body.append(head, mdBody(m.text, m.mentions));
     line.append(body);
-    return line;
+    return withPin(line, r, m);
   }
 
   // One log row for a message. `live` is true when appendMsg adds it as it arrives:
@@ -1007,6 +1123,7 @@
     composerPlaceholder();
     updateRoomEmpty();
     renderRows(r);
+    renderPins();
     log.scrollTop = log.scrollHeight;
   }
 
@@ -1136,6 +1253,12 @@
     return m._statusDeadline !== undefined && performance.now() >= m._statusDeadline;
   }
 
+  function claimDeadline(c) {
+    if (c._deadline === undefined && Number.isFinite(c.remaining_s))
+      c._deadline = performance.now() + c.remaining_s * 1000;
+    return c._deadline;
+  }
+
   function memberRow(m) {
     const li = el('li', 'member');
     li.dataset.name = m.name;
@@ -1154,6 +1277,8 @@
     if (flag) nameLine.append(flag);
     let st = statusWord(m) + ' · ' + harnessOf(m.harness)[1];
     if (m.queued) st += ' · ' + m.queued + ' queued';
+    // the hold on agents' chatter (#137): when those messages wake it, unless you wake it first
+    if (m.wakes_at) st += ' · wakes at ' + hhmm(m.wakes_at);
     if (m.inflight) st += ' · ' + m.inflight + ' in flight';
     if (m.held) st += ' · held';
     if (m.env_leak) st += ' · env shared';
@@ -1167,6 +1292,11 @@
       const work = el('span', 'm-work', m.status_line);
       if (statusLineStale(m)) work.append(el('span', 'm-work-stale', 'Stale'));
       main.append(work);
+    }
+    for (const c of m.claims || []) {
+      if (!Number.isFinite(claimDeadline(c)) || claimDeadline(c) <= performance.now()) continue;
+      const until = new Date(c.expires_at * 1000).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+      main.append(el('span', 'm-claim-entry', 'Claim: ' + c.key + ' · Expires ' + until));
     }
     if (m.away) main.append(el('span', 'm-away', 'Away: ' + m.away));
     if (m.parked) {
@@ -1224,8 +1354,12 @@
     const nextStatus = members.filter(function (m) {
       return m.status_line && !statusLineStale(m) && m._statusDeadline !== undefined;
     }).map(function (m) { return m._statusDeadline - performance.now(); });
-    if (nextStatus.length) {
-      state.statusTimer = setTimeout(renderBuddies, Math.max(1, Math.ceil(Math.min(...nextStatus))));
+    const nextClaims = members.flatMap(function (m) {
+      return (m.claims || []).map(claimDeadline).filter(function (d) { return d > performance.now(); })
+        .map(function (d) { return d - performance.now(); });
+    });
+    if (nextStatus.length || nextClaims.length) {
+      state.statusTimer = setTimeout(renderBuddies, Math.max(1, Math.ceil(Math.min(...nextStatus, ...nextClaims))));
     }
     refocus(list, focused);
     const bypass = members.some(function (m) { return m.approval_mode === 'bypass'; });
@@ -1237,21 +1371,44 @@
     renderRoomPeople();
   }
 
-  // A private room's people (§44): who sees it, with Remove, Leave and Add a person. A public
-  // room shows nothing here: everyone signed in sees it.
+  // A room's people. A private room's (§44) are who sees it, with Remove, Leave and Add a person.
+  // A public room on a hosted broker lists everyone signed up, since everyone sees it (#354):
+  // before, it showed nobody, and the other people in a room were only names on messages. Each
+  // row has a dot for a page open now, and those people come first. A desktop broker has one
+  // person and shows no list.
+  const PEOPLE_SHOWN = 10;  // a longer public list starts with this many, then "N more"
+
   function renderRoomPeople() {
     const r = activeRoom();
     const box = $('room-people');
-    const show = !!(r && r.private && r.people);
+    const isPrivate = !!(r && r.private && r.people);
+    const everyone = isPrivate ? r.people : (r && state.everyone.length > 1 ? state.everyone : null);
+    const show = !!everyone;
     box.classList.toggle('hidden', !show);
     if (!show) { box.replaceChildren(); return; }
     const focused = focusKey(box);
-    const title = el('div', 'group-label', 'People (' + r.people.length + ') · private');
+    const stale = !state.wsOpen && state.wsEverOpen;  // as the agents' list: what was last known
+    const title = el('div', 'group-label',
+      'People (' + everyone.length + ')' + (isPrivate ? ' · private' : '') + (stale ? ' · last known' : ''));
     const list = el('ul', 'member-list');
-    for (const n of r.people) {
+    list.classList.toggle('stale', stale);
+    const here = function (n) { return state.online.has(n); };
+    // those with a page open first, each group in the order it came
+    const ordered = everyone.filter(here).concat(everyone.filter(function (n) { return !here(n); }));
+    const cut = !isPrivate && !state.peopleAll && ordered.length > PEOPLE_SHOWN;
+    for (const n of (cut ? ordered.slice(0, PEOPLE_SHOWN) : ordered)) {
       const li = el('li', 'person-row');
       li.dataset.name = n;
-      li.append(icon('person'), el('span', 'm-name', n));
+      const dot = el('span', 'p-dot ' + (here(n) ? 'on' : 'off'));
+      dot.setAttribute('role', 'img');
+      dot.setAttribute('aria-label', here(n) ? 'online' : 'offline');
+      dot.title = here(n) ? 'Has switchboard open now' : 'Not here now';
+      li.append(dot, el('span', 'm-name', n));
+      if (!isPrivate) {
+        if (state.me && n === state.me.human) li.append(el('span', 'p-you', 'you'));
+        list.append(li);
+        continue;
+      }
       const mine = state.me && n === state.me.human;
       const b = btn('btn btn-ghost-sm', mine ? 'Leave' : 'Remove');
       b.dataset.focus = 'room-person:' + n;
@@ -1260,11 +1417,23 @@
       li.append(b);
       list.append(li);
     }
-    const add = btn('btn invite-btn', 'Add a person');
-    add.id = 'room-people-add';
-    add.dataset.focus = 'room-people-add';
-    add.addEventListener('click', function () { addRoomPerson(r); });
-    box.replaceChildren(title, list, add);
+    if (isPrivate) {
+      const add = btn('btn invite-btn', 'Add a person');
+      add.id = 'room-people-add';
+      add.dataset.focus = 'room-people-add';
+      add.addEventListener('click', function () { addRoomPerson(r); });
+      box.replaceChildren(title, list, add);
+    } else if (ordered.length > PEOPLE_SHOWN) {
+      const more = btn('btn btn-ghost-sm', cut ? (ordered.length - PEOPLE_SHOWN) + ' more' : 'Show fewer');
+      more.id = 'room-people-more';
+      more.dataset.focus = 'room-people-more';
+      more.setAttribute('aria-expanded', String(!cut));
+      more.addEventListener('click', function () {
+        state.peopleAll = !state.peopleAll;
+        renderRoomPeople();
+      });
+      box.replaceChildren(title, list, more);
+    } else box.replaceChildren(title, list);
     refocus(box, focused);
   }
 
@@ -1903,6 +2072,16 @@
       hold.title = 'Hold: stop delivery to ' + m.name + '; messages wait until you release it';
     }
     hold.addEventListener('click', function () { submitText((m.held ? '/release ' : '/hold ') + m.name); });
+    // Wake now (#137): only while agents' chatter waits on the hold for this member
+    let wake = null;
+    if (m.wakes_at) {
+      wake = btn('btn');
+      wake.id = 'insp-wake';
+      wake.dataset.focus = 'wake';
+      wake.append(icon('bell'), 'Wake now');
+      wake.title = 'Wake now: ' + m.name + ' gets its waiting messages now, not at ' + hhmm(m.wakes_at) + ' (web only)';
+      wake.addEventListener('click', function () { submitText('/wake ' + m.name); });
+    }
     const cu = btn('btn');
     cu.id = 'insp-catchup';
     cu.dataset.focus = 'catchup';
@@ -1912,6 +2091,7 @@
     cu.title = '/catchup ' + m.name + ' on a member, a topic or the room';
     cu.append(icon('history'), 'Catch up on…', icon('chev-down'));
     cu.addEventListener('click', function () { setMenu(!ui.menu); });
+    if (wake) row.append(wake);
     row.append(hold, cu);
     refs.hold = hold;
     refs.catchup = cu;
@@ -1973,7 +2153,9 @@
     });
     refs.kick = kick;
     const fine = el('p', 'fine');
-    fine.append('Same as ', el('code', null, '/hold'), ', ', el('code', null, '/catchup'), ' and ', el('code', null, '/kick'), ' in the composer.');
+    fine.append('Same as ');
+    if (wake) fine.append(el('code', null, '/wake'), ', ');
+    fine.append(el('code', null, '/hold'), ', ', el('code', null, '/catchup'), ' and ', el('code', null, '/kick'), ' in the composer.');
     actions.append(menu, row, kick, fine);
 
     body.replaceChildren(id);
@@ -2043,10 +2225,18 @@
       usage: '/hops   /hops <n>   (0–1000, 0 turns it off)', detail: 'A new limit never lifts a loop-guard pause: /resume does.', live: 'hops' },
     { group: 'Room', cmd: 'close', args: '', desc: 'Close the room; the history is kept', pill: '', usage: '/close',
       detail: 'Asks first. Reopen it from Closed rooms.' },
+    { group: 'Room', cmd: 'pin', args: '<id>', desc: 'Pin a message for every agent that joins', pill: 'web only',
+      usage: '/pin <id>   (the #number on a message)',
+      detail: 'Up to five. Agents that join are shown it, and /catchup carries it. Agents can’t pin.' },
+    { group: 'Room', cmd: 'unpin', args: '<id>', desc: 'Unpin a message', pill: '', usage: '/unpin <id>',
+      detail: 'It stays in the history; agents that join no longer see it first.' },
     { group: 'Agents', cmd: 'hold', args: '<name>', desc: 'Stop delivery to one agent', pill: '', usage: '/hold <name>',
       detail: 'Nothing is dropped: held messages go out on /release.' },
     { group: 'Agents', cmd: 'release', args: '<name>', desc: 'Resume delivery to a held agent', pill: 'web only', usage: '/release <name>',
       detail: 'Raises agent activity, so it needs this signed-in browser.' },
+    { group: 'Agents', cmd: 'wake', args: '<name>', desc: 'Wake an agent now for its waiting messages', pill: 'web only',
+      usage: '/wake <name>',
+      detail: 'Agents’ messages that don’t address it wait a few minutes to arrive together; this sends them now.' },
     { group: 'Agents', cmd: 'kick', args: '<name>', desc: 'Remove an agent and revoke its membership', pill: '', usage: '/kick <name>',
       detail: 'Asks first. Removes it from {room} and revokes its membership.' },
     { group: 'Agents', cmd: 'review', args: '<url> [note]', desc: 'Start a review board for a PR or MR', pill: '',
@@ -2550,6 +2740,13 @@
       if (!r) return;
       r.settings = f.settings || {};
       if (f.room === state.active) renderStatus();
+    } else if (f.t === 'pins') {
+      if (!r) return;
+      r.pins = Array.isArray(f.pins) ? f.pins : [];
+      if (f.room === state.active) {
+        renderPins();
+        markPinned(r);
+      }
     } else if (f.t === 'notice') {
       if (!f.room || f.room === state.active) renderLocal(f.text, f.level === 'warn');
     } else if (f.t === 'rooms') {
@@ -2559,10 +2756,17 @@
       if (!$('closed-panel').classList.contains('hidden')) loadClosed().catch(function () {});
     } else if (f.t === 'review') {
       if (!r) return;
+      // An older HTTP board read may still be in flight. Keep this live frame authoritative.
+      r.boardGeneration = (r.boardGeneration || 0) + 1;
       r.board = f.board || null;
       if (f.room === state.active) renderBoard();
     } else if (f.t === 'remotes') {
       setRemotes(f.remotes || [], f.config_error || null);
+    } else if (f.t === 'people') {
+      // who is on this switchboard, and who has a page open (#354): the People list
+      state.everyone = Array.isArray(f.people) ? f.people.filter(function (n) { return typeof n === 'string'; }) : [];
+      state.online = new Set(Array.isArray(f.online) ? f.online : []);
+      renderRoomPeople();
     } else if (f.t === 'machines') {
       setMachines(f.machines || [], f.codes || []);
     }
@@ -4283,6 +4487,49 @@
     return card;
   }
 
+  // Who can't sign in (#240, DESIGN.md §39.3): a person with no email, since only an email (or
+  // `admin`) signs anyone in. The admin is told how many there are, and who, so they can set the
+  // emails. The admin isn't counted: `admin` signs them in whatever happens. This follows the
+  // broker's rule (people.account).
+  function peopleWithoutEmail() {
+    return state.people.filter(function (p) { return !p.admin && !p.email; });
+  }
+
+  function personLabel(p) {
+    return [p.first_name, p.last_name].filter(Boolean).join(' ') || p.name;
+  }
+
+  // Each name goes to that person's Email field, where the admin sets it: their cards are further
+  // down, and focus lands in the field, not on a button that is about to disappear.
+  function noEmailNote(who) {
+    const one = who.length === 1;
+    const list = el('ul', 'no-email-list');
+    for (const p of who) {
+      const b = btn('btn btn-ghost-sm', personLabel(p));
+      b.dataset.focus = 'no-email:' + p.id;
+      b.title = 'Go to the Email field of ' + p.name;
+      b.setAttribute('aria-label', 'Set an email for ' + personLabel(p));
+      b.addEventListener('click', function () {
+        const input = document.getElementById('email-' + p.id);
+        if (!input) return;
+        const card = input.closest('.person-card');
+        if (card) card.scrollIntoView({ block: 'start' });
+        tryFocus(input);
+      });
+      const li = el('li');
+      li.append(b);
+      list.append(li);
+    }
+    const title = one ? '1 person can’t sign in' : who.length + ' people can’t sign in';
+    const n = note('amber', 'info', title, [
+      el('p', null, 'They have no email, and only an email signs someone in.'
+        + ' Set one for ' + (one ? 'them' : 'each of them') + '.'),
+      list,
+    ]);
+    n.id = 'no-email-note';
+    return n;
+  }
+
   function peopleResult(id, text, bad) {
     const n = document.getElementById('people-result-' + id);
     if (n) {
@@ -4549,8 +4796,8 @@
     if (!p.admin && p.passkeys && p.sign_in !== 'passkey') bits.push(plural(p.passkeys, 'passkey', 'passkeys'));
     if (p.admin) bits.push(p.password ? 'password' : 'no password', plural(p.passkeys || 0, 'passkey', 'passkeys'));
     if (!p.email) {
-      bits.push(p.admin ? 'no email yet: you sign in with your name, or admin'
-        : 'no email yet: signs in with their name');
+      bits.push(p.admin ? 'no email yet: you sign in as admin'
+        : 'no email yet: can’t sign in until you set one');
     }
     card.append(el('p', 'machine-step', bits.join(' · ')));
     card.append(nameRow(p), emailRow(p));
@@ -4602,6 +4849,8 @@
     const typing = f && f.id === 'person-name';
     body.replaceChildren();
     if (state.invite) body.append(inviteCard(state.invite));
+    const noEmail = peopleWithoutEmail();
+    if (noEmail.length) body.append(noEmailNote(noEmail));
     body.append(addPersonCard());
     for (const p of state.people) body.append(personCard(p));
     if (state.privateRooms && state.privateRooms.length) body.append(privateRoomsCard(state.privateRooms));
@@ -4881,13 +5130,20 @@
     raised: 'Raised', contested: 'Contested', conceded: 'Being fixed', fixed: 'Fixed', dropped: 'Dropped',
     open: 'Waiting for you', answered: 'Answered',
   };
+  // a dropped finding deferred to a follow-up ticket (#371) reads as that, not as withdrawn
+  function boardStateWord(i) { return i.deferred_to ? 'Deferred' : BOARD_STATE[i.state] || i.state; }
+  function boardStateClass(i) { return 'board-state s-' + (i.deferred_to ? 'deferred' : i.state); }
 
   async function loadBoard(r) {
     if (!r) return;
+    // Only the latest read may apply; a newer read or live frame makes this response stale.
+    const generation = r.boardGeneration = (r.boardGeneration || 0) + 1;
     try {
       const res = await api('GET', '/api/rooms/' + encodeURIComponent(r.slug) + '/review');
+      if (r.boardGeneration !== generation) return;
       r.board = res.board || null;
     } catch (e) {
+      if (r.boardGeneration !== generation) return;
       r.board = r.board || null;
     }
     if (r.name === state.active) renderBoard();
@@ -4906,6 +5162,7 @@
 
   function renderBoard() {
     const handoffFocused = document.activeElement && document.activeElement.id === 'board-handoff';
+    const dividerFocused = document.activeElement && document.activeElement.id === 'board-divider';
     const r = activeRoom();
     const b = r ? r.board : null;
     const toggle = $('board-toggle');
@@ -4918,6 +5175,7 @@
     const box = $('board');
     box.classList.toggle('hidden', !open);
     if (!open) {
+      boardParts = null;
       box.replaceChildren();
       return;
     }
@@ -4942,6 +5200,13 @@
       const sha = el('code', 'board-head-sha', b.head.slice(0, 7));
       sha.title = b.head;
       title.append(sha);
+    }
+    // what an agent last read off the pull request (#291): its claim, named as its, never checked
+    if (b.report) {
+      const rep = el('span', 'board-report', b.report);
+      rep.id = 'board-report';
+      rep.title = b.reported_by + ' read this off the pull request with its own tools; switchboard fetches nothing';
+      title.append(rep);
     }
     const c = b.counts || {};
     // a board a person just started with /review (#248) has nothing on it: not settled, waiting
@@ -4992,11 +5257,13 @@
         card.dataset.item = i.label;
         card.setAttribute('aria-pressed', String(state.boardSel === i.label));
         const top = el('span', 'board-card-top');
-        top.append(el('span', 'board-label', i.label), el('span', 'board-state s-' + i.state, BOARD_STATE[i.state] || i.state));
+        top.append(el('span', 'board-label', i.label), el('span', boardStateClass(i), boardStateWord(i)));
         card.append(top, el('span', 'board-card-title', i.title));
-        const meta = i.state === 'dropped' && i.reason ? i.reason : [boardWhere(i), boardWho(i)].filter(Boolean).join(' · ');
+        const meta = i.deferred_to ? 'Deferred to ' + i.deferred_to
+          : i.state === 'dropped' && i.reason ? i.reason : [boardWhere(i), boardWho(i)].filter(Boolean).join(' · ');
         card.append(el('span', 'board-card-meta', meta));
-        if (i.state === 'dropped') card.classList.add('dropped');
+        if (i.outdated_head) card.append(outdatedMark('span', i));
+        if (i.state === 'dropped') card.classList.add(i.deferred_to ? 'deferred' : 'dropped');
         card.addEventListener('click', function () {
           state.boardSel = state.boardSel === i.label ? null : i.label;
           renderBoard();
@@ -5011,14 +5278,130 @@
     const body = el('div', 'board-body');
     body.append(lanes);
     const sel = state.boardSel ? b.items.find(function (i) { return i.label === state.boardSel; }) : null;
-    if (sel) body.append(boardDetail(r, sel));
-    else state.boardSel = null;
+    boardParts = null;
+    if (sel) {
+      // the card beside the lanes, with the divider that trades width between them (#343)
+      const divider = boardDivider();
+      const detail = boardDetail(r, sel);
+      body.classList.add('has-detail');
+      body.append(divider, detail);
+      boardParts = { body: body, divider: divider, detail: detail, rung: null };
+      applyBoardDetailW();
+    } else state.boardSel = null;
     if (unable.length) box.replaceChildren(head, notes, body);
     else box.replaceChildren(head, body);
+    syncBoardDivider();
     if (handoffFocused) {
       const handoff = $('board-handoff');
       if (handoff) handoff.focus();
     }
+    // every board event redraws the board: the divider keeps the focus it had
+    if (dividerFocused && boardParts) boardParts.divider.focus();
+  }
+
+  // The open card's width (#343). It was a fixed 340 px, cramped on a wide window. The card now
+  // takes a share of the board, and the divider between it and the lanes is dragged, or moved
+  // with the arrow keys, to trade width between the two. This page never writes a style (the
+  // CSP, and the static test that keeps it honest), so the width is one of a ladder of classes
+  // on the board's body, dw-0 (340 px) to dw-60 in steps of 24 px, or dw-max for all the lanes
+  // can spare; style.css has the ladder and the same numbers. It is kept in state, so a redraw
+  // and the next card open at it, and it lasts while the page is open.
+  const BOARD_DETAIL_MIN = 340;  // the card's old fixed width, and dw-0
+  const BOARD_LANES_MIN = 420;   // three lanes, each wide enough for a title to read a word at a time
+  const BOARD_DIVIDER = 18;      // the divider's track and the gap on each side of it
+  const BOARD_STEP = 24;         // one rung of the ladder, and one press of an arrow key
+  const BOARD_STEPS = 60;        // the top rung, 1780 px
+  let boardParts = null;         // { body, divider, detail, rung } while a card is open
+
+  // What the card's width may be now, or null when there is nothing to resize: no card is
+  // open, or the board is too narrow and the card sits under the lanes.
+  function boardDetailRange() {
+    const parts = boardParts;
+    if (!parts || typeof parts.body.getBoundingClientRect !== 'function') return null;
+    const whole = parts.body.getBoundingClientRect();
+    const max = Math.floor(whole.width) - BOARD_DIVIDER - BOARD_LANES_MIN;
+    if (max < BOARD_DETAIL_MIN) return null;
+    const card = parts.detail.getBoundingClientRect();
+    return { min: BOARD_DETAIL_MIN, max: max, now: Math.round(card.width), left: card.left, right: whole.right };
+  }
+
+  function applyBoardDetailW() {
+    const parts = boardParts;
+    if (!parts) return;
+    if (parts.rung) parts.body.classList.remove(parts.rung);
+    parts.rung = state.boardDetailW === null ? null : 'dw-' + state.boardDetailW;
+    if (parts.rung) parts.body.classList.add(parts.rung);
+  }
+
+  // px goes to the nearest rung within the range; null goes back to the card's share of the board
+  function setBoardDetailW(px) {
+    const range = boardDetailRange();
+    if (!range) return;
+    if (px === null) state.boardDetailW = null;
+    else if (px >= range.max) state.boardDetailW = 'max';
+    else {
+      const rung = Math.round((Math.max(range.min, px) - BOARD_DETAIL_MIN) / BOARD_STEP);
+      state.boardDetailW = Math.min(BOARD_STEPS, rung);
+    }
+    applyBoardDetailW();
+    syncBoardDivider();
+  }
+
+  // a separator that takes focus says where it is and how far it can go
+  function syncBoardDivider() {
+    const range = boardDetailRange();
+    if (!range) return;
+    const d = boardParts.divider;
+    d.setAttribute('aria-valuemin', String(range.min));
+    d.setAttribute('aria-valuemax', String(range.max));
+    d.setAttribute('aria-valuenow', String(range.now));
+    d.setAttribute('aria-valuetext', 'The open card is ' + range.now + ' pixels wide');
+  }
+
+  function boardDivider() {
+    const d = el('div', 'board-divider');
+    d.id = 'board-divider';
+    d.tabIndex = 0;
+    d.setAttribute('role', 'separator');
+    d.setAttribute('aria-orientation', 'vertical');
+    d.setAttribute('aria-label', 'Resize the open card');
+    d.title = 'Drag to resize the open card. Double-click to reset.';
+    d.addEventListener('pointerdown', function (e) {
+      const from = boardDetailRange();
+      if (!from || (e.button !== undefined && e.button !== 0)) return;
+      e.preventDefault();  // no text selection while dragging
+      d.focus();
+      // The listeners are on the window, not the divider: a board event redraws the board
+      // mid-drag, and the divider under the pointer is then a new element.
+      const grab = from.left - e.clientX;  // the pointer stays this far from the card's edge
+      const move = function (ev) {
+        const range = boardDetailRange();
+        if (range) setBoardDetailW(range.right - ev.clientX - grab);
+      };
+      const stop = function () {
+        window.removeEventListener('pointermove', move);
+        window.removeEventListener('pointerup', stop);
+        window.removeEventListener('pointercancel', stop);
+        document.documentElement.classList.remove('board-resizing');
+      };
+      window.addEventListener('pointermove', move);
+      window.addEventListener('pointerup', stop);
+      window.addEventListener('pointercancel', stop);
+      document.documentElement.classList.add('board-resizing');
+    });
+    d.addEventListener('keydown', function (e) {
+      const range = boardDetailRange();
+      if (!range) return;
+      // Left moves the divider left, which widens the card; Home and End are its limits
+      const to = e.key === 'ArrowLeft' ? range.now + BOARD_STEP
+        : e.key === 'ArrowRight' ? range.now - BOARD_STEP
+          : e.key === 'Home' ? range.min : e.key === 'End' ? range.max : null;
+      if (to === null) return;
+      e.preventDefault();
+      setBoardDetailW(to);
+    });
+    d.addEventListener('dblclick', function () { setBoardDetailW(null); });
+    return d;
   }
 
   // One agent posts the reviewed summary and each person-decided line (§37.6).
@@ -5074,6 +5457,15 @@
     dl.append(el('dt', null, label), dd);
   }
 
+  // A finding the board moved past (#291). The commit is cut to seven characters, as the board's
+  // header shows its head: an agent may give all forty, which wrapped over three lines of a card.
+  // The whole of it is in the title.
+  function outdatedMark(tag, i) {
+    const m = el(tag, 'board-outdated', 'Outdated at ' + i.outdated_head.slice(0, 7));
+    m.title = 'The board moved to ' + i.outdated_head + ' after this was raised: check it again';
+    return m;
+  }
+
   // A card's detail is short and links out (#250): one line on what's wrong, its lines on the
   // PR or MR where the forge draws the colored diff, the fix's commit, and who did what. A
   // contested finding shows both sides side by side, above the person's choice.
@@ -5083,8 +5475,9 @@
     const d = el('aside', 'board-detail');
     d.setAttribute('aria-label', i.label + ' detail');
     const top = el('div', 'board-detail-top');
-    top.append(el('span', 'board-state s-' + i.state, BOARD_STATE[i.state] || i.state), el('h3', null, i.label + ' · ' + i.title));
+    top.append(el('span', boardStateClass(i), boardStateWord(i)), el('h3', null, i.label + ' · ' + i.title));
     d.append(top, el('p', 'board-detail-state', boardWho(i)));
+    if (i.outdated_head) d.append(outdatedMark('p', i));
     const contested = i.state === 'contested';
     if (i.detail && !contested) d.append(mdBody(i.detail, []));
     const rows = el('dl', 'board-rows');
@@ -5115,7 +5508,8 @@
       d.append(sides);
     }
     if (i.answer) d.append(el('p', 'board-answer', 'Answer: ' + i.answer));
-    if (i.reason && i.state === 'dropped') d.append(el('p', 'board-reason', 'Dropped: ' + i.reason));
+    if (i.deferred_to) d.append(el('p', 'board-reason', 'Deferred to ' + i.deferred_to));
+    else if (i.reason && i.state === 'dropped') d.append(el('p', 'board-reason', 'Dropped: ' + i.reason));
     if (i.history && i.history.length) {
       const ol = el('ol', 'board-history');
       ol.setAttribute('aria-label', 'History');
@@ -5136,28 +5530,81 @@
         acts.append(b);
       });
     }
-    if (i.state === 'contested') {
-      const agents = r.members || [];
-      const label = el('label', 'board-field', 'Owner');
+    // the agents a finding can go to, the first preselected: not its raiser, whose finding it is,
+    // nor (on a reassign) its current owner (#371: the raiser was preselected, so a person's
+    // concede gave the fix to the agent that asked for it)
+    function ownerPick(id, skip) {
+      const agents = (r.members || []).map(function (m) { return m.name; });
       const pick = el('select');
-      pick.id = 'board-owner';
-      for (const m of agents) {
-        const o = el('option', null, m.name);
-        o.value = m.name;
+      pick.id = id;
+      const order = agents.filter(function (n) { return skip.indexOf(n) < 0; })
+        .concat(agents.filter(function (n) { return skip.indexOf(n) >= 0; }));
+      for (const n of order) {
+        const o = el('option', null, n);
+        o.value = n;
         pick.append(o);
       }
+      return pick;
+    }
+    if (i.state === 'contested') {
+      const label = el('label', 'board-field', 'Owner');
+      const pick = ownerPick('board-owner', [i.raised_by]);
       label.append(pick);
       const concede = btn('btn-primary', 'Concede');
       concede.id = 'board-concede';
-      concede.disabled = !agents.length;
+      concede.disabled = !pick.options.length;
       concede.addEventListener('click', function () { boardMove({ action: 'concede', item: i.label, owner: pick.value }); });
       acts.append(label, concede);
     }
-    if (i.state === 'fixed' && !i.confirmed_by && i.needs_person) {
-      const confirm = btn('btn-primary', 'Confirm fix');
+    if (i.state === 'conceded') {
+      // a person reassigns it (its owner left, or should hand over), or rules it fixed (#371)
+      const label = el('label', 'board-field', 'Owner');
+      const pick = ownerPick('board-reassign-owner', [i.owner, i.raised_by]);
+      label.append(pick);
+      const reassign = btn('btn', 'Reassign');
+      reassign.id = 'board-reassign';
+      reassign.disabled = !pick.options.length;
+      reassign.title = 'Give ' + i.label + ' to another agent to fix';
+      reassign.addEventListener('click', function () {
+        if (pick.value === i.owner) { pick.focus(); return; }
+        boardMove({ action: 'concede', item: i.label, owner: pick.value });
+      });
+      const fixed = btn('btn', 'Mark fixed');
+      fixed.id = 'board-mark-fixed';
+      fixed.title = 'Settle ' + i.label + ' as fixed, on your say: no agent needs to confirm it';
+      fixed.addEventListener('click', function () { boardMove({ action: 'fix', item: i.label }); });
+      // one set, so on a phone Mark fixed wraps with Reassign, not beside Drop's reason
+      const set = el('div', 'board-action-set');
+      set.append(label, reassign, fixed);
+      acts.append(set);
+    }
+    if (i.state === 'fixed' && !i.confirmed_by) {
+      // any fix: when its raiser can't check it (needs_person), or as a person's own ruling (#371)
+      const confirm = btn(i.needs_person ? 'btn-primary' : 'btn', 'Confirm fix');
       confirm.id = 'board-confirm';
       confirm.addEventListener('click', function () { boardMove({ action: 'confirm', item: i.label }); });
       acts.append(confirm);
+    }
+    if (i.kind === 'finding' && ['raised', 'contested', 'conceded'].indexOf(i.state) >= 0) {
+      // settled for this pull request, to be done in a follow-up ticket (#371): not withdrawn
+      const tlabel = el('label', 'board-field', 'Follow-up ticket');
+      const ticket = el('input');
+      ticket.id = 'board-ticket';
+      ticket.type = 'text';
+      ticket.maxLength = 200;
+      ticket.placeholder = 'SHOP-123 or a link';
+      tlabel.append(ticket);
+      const defer = btn('btn', 'Defer');
+      defer.id = 'board-defer';
+      defer.title = 'Settle ' + i.label + ' for this pull request: it goes to that follow-up ticket';
+      defer.addEventListener('click', function () {
+        const key = String(ticket.value || '').trim();
+        if (!key) { ticket.focus(); return; }
+        boardMove({ action: 'defer', item: i.label, reason: key });  // the ticket, as the reason
+      });
+      const set = el('div', 'board-action-set');
+      set.append(tlabel, defer);
+      acts.append(set);
     }
     if (['raised', 'contested', 'conceded', 'open'].indexOf(i.state) >= 0) {
       const label = el('label', 'board-field', 'Reason to drop');
@@ -5464,6 +5911,8 @@
       renderInspector();
     });
     if (typeof window.addEventListener === 'function') window.addEventListener('resize', setOverlay);
+    // the divider's limits follow the window (#343)
+    if (typeof window.addEventListener === 'function') window.addEventListener('resize', syncBoardDivider);
     setPaneView(false);
     setOverlay();
     updateWelcome();
@@ -5515,6 +5964,7 @@
       r.createdAt = l.created_at;
       r.settings = l.settings || {};
       r.rules = l.rules || '';
+      r.pins = Array.isArray(l.pins) ? l.pins : [];  // the room's pinned messages (#292)
       r.private = !!l.private;  // seen only by its people (§44)
       r.people = Array.isArray(l.people) ? l.people : null;
     }
@@ -5535,6 +5985,8 @@
       if (pruned || $('empty').classList.contains('hidden') === (state.rooms.size === 0)) renderLog();
       renderBuddies();
       renderStatus();
+      renderPins();  // the listing is the truth about the pins too, after a reconnect (#292)
+      if (activeRoom()) markPinned(activeRoom());
     }
     if (pruned) renderLocal(was + ' is no longer open (closed or deleted); Closed rooms can reopen a closed room');
     return fresh;
@@ -5542,6 +5994,10 @@
 
   async function boot() {
     bindInput();
+    $('pins-toggle').addEventListener('click', function () {
+      state.pinsOpen = !state.pinsOpen;
+      renderPins();
+    });
     keepLogPinned();
     try {
       state.me = await api('GET', '/api/me');

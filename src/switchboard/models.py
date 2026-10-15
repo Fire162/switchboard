@@ -9,7 +9,7 @@ import json
 import re
 import sqlite3
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from switchboard import __version__
 
@@ -35,6 +35,32 @@ def behind_by_minor(claim: str | None, broker: str = __version__) -> bool:
     if old is None or current is None:
         return False
     return (int(old[1]), int(old[2])) < (int(current[1]), int(current[2]))
+
+
+# The first release whose MCP server has each tool parameter that broker text tells an agent to
+# use (DESIGN.md §6.1, #340). A session keeps the MCP server it started with, so after `switchboard update` it
+# can be older than the broker, and a hint naming a parameter its tool lacks sends it to a call
+# its own schema refuses. Add a line here before writing a hint that names a newer parameter
+# (the release is the first tag that contains the commit that added it).
+Feature = Literal["join.resume", "read.before", "review.proof"]
+FEATURE_SINCE: dict[Feature, tuple[int, int]] = {
+    "join.resume": (0, 25),  # #304
+    "read.before": (0, 25),  # #300
+    "review.proof": (0, 26),  # #251
+}
+_MAX_CLAIM = 32  # a version claim is cut to this (agents.VERSION_RE) before it gets here
+
+
+def has_feature(claim: str | None, feature: Feature) -> bool:
+    """Whether an MCP server that claims release ``claim`` has ``feature``. Fails closed: a claim
+    that is missing, not a string, too long or not ``X.Y.Z`` (with an optional suffix, ignored
+    as ``behind_by_minor`` does) has nothing, so a hint is never sent on a guess. The claim comes
+    from the session, which can say anything; it grants nothing, it only picks the wording.
+    A ``feature`` that is not in ``FEATURE_SINCE`` is a bug in the caller and raises ``KeyError``."""
+    if not isinstance(claim, str) or len(claim) > _MAX_CLAIM:
+        return False
+    got = RELEASE_RE.fullmatch(claim)
+    return got is not None and (int(got[1]), int(got[2])) >= FEATURE_SINCE[feature]
 
 
 # A remote host's name (DESIGN.md §27.5.1): the config name of a remote in remotes.toml.
@@ -240,6 +266,19 @@ class Message:
         )
 
 
+MAX_PINS = 5  # a room's pinned decisions (#292, DESIGN.md §48)
+
+
+@dataclass(frozen=True)
+class Pin:
+    """A message a person pinned in its room (#292): shown to every agent that joins, and in the
+    web UI's room header."""
+
+    message: Message
+    pinned_by: str
+    pinned_at: float
+
+
 @dataclass(frozen=True)
 class Member:
     """An active membership joined with its participant: the buddy-list row."""
@@ -265,10 +304,12 @@ class Member:
     board_why: str | None = None  # why it can't use the review board, from its MCP server (#249)
     version_claim: str | None = None  # this member's MCP server says it runs this version
     tools_claim: tuple[str, ...] | None = None  # None means the MCP server did not report tools
+    wakes_at: float | None = None  # when held chatter wakes it (#137), from the engine
     status_line: str | None = None
     status_line_at: float | None = None
     status_line_stale: bool = False
     status_line_remaining_s: float | None = None
+    claims: tuple[dict[str, Any], ...] = ()  # advisory outside work held by this membership (§46)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -573,6 +614,7 @@ class Item:
     reminders: int = 0
     in_context_at: float | None = None
     sender_host: str | None = None  # a remote agent sender's host (DESIGN.md §27.11)
+    reply_to_me: bool = False  # a reply to the recipient's own message (#137, §8.2)
 
     @classmethod
     def from_row(cls, r: sqlite3.Row) -> "Item":
@@ -581,7 +623,7 @@ class Item:
         except (ValueError, IndexError, KeyError):
             mentions = ()
         opt: dict[str, Any] = {}
-        for k in ("redelivered", "reminders", "in_context_at", "sender_host"):
+        for k in ("redelivered", "reminders", "in_context_at", "sender_host", "reply_to_me"):
             try:
                 opt[k] = r[k]
             except (IndexError, KeyError):
@@ -606,6 +648,7 @@ class Item:
             reminders=int(opt.get("reminders") or 0),
             in_context_at=opt.get("in_context_at"),
             sender_host=opt.get("sender_host"),
+            reply_to_me=bool(opt.get("reply_to_me") or 0),
         )
 
     @property

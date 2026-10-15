@@ -1,4 +1,4 @@
-# Media: UI and CLI screenshots, the tab icon, and the getting-started video
+# Media: UI and CLI screenshots, recordings for pull requests, the tab icon, and the getting-started video
 
 ## The UI screenshots (`ui/`)
 
@@ -18,6 +18,7 @@ It drives headless Chromium through Playwright (a dev dependency): run `uv run p
 | File | Shows |
 |---|---|
 | `desktop-light.png`, `desktop-dark.png` | the main view with Members |
+| `claims-before-{light,dark,phone-light}.png`, `claims-after-{light,dark,phone-light}.png` | Members before and after claude-1 claims a build, with its holder and expiry (#293) |
 | `inspector-light.png` | codex-1 in the Inspector: approvals off, held, queued list open |
 | `inspector-dark-parked.png` | devin-1, parked |
 | `inspector-remote-light.png` | bench, on the remote `fpga-pi` |
@@ -45,6 +46,7 @@ It drives headless Chromium through Playwright (a dev dependency): run `uv run p
 | `setup-person-light.png` | a teammate choosing their own password after their one-time password |
 
 Re-run it whenever the UI changes, and look at every picture before committing them.
+For review board head changes, `ui_shots.py` also writes `outdated-before-*` and `outdated-after-*` PNGs in light, dark and phone light: the selected finding gains the new head mark.
 
 ## The CLI screenshots (`cli_shots.py`)
 
@@ -54,8 +56,24 @@ Re-run it whenever the UI changes, and look at every picture before committing t
 uv run python docs/media/cli_shots.py --out /tmp/cli-shots
 ```
 
-- **Real commands against seeded data.** It uses the same isolation and seeded broker as `ui_shots.py` (`tests/ui_world.py`). Then, in-process with `--color always`, it runs `status`, `who '#build'`, `tail '#build'`, `remote status` and `report` against that broker, and `install all --dry-run` / `uninstall all --dry-run` against a throwaway user home. The PATH holds stub `claude`, `codex` and `devin` commands and no Cursor CLI, so Cursor shows as skipped. The install diff shows `/opt/switchboard/bin/python3` as the interpreter the hooks run, not this checkout's venv. `/hold` and `/release` fire once so the report has a rule to colour.
+- **Real commands against seeded data.** It uses the same isolation and seeded broker as `ui_shots.py` (`tests/ui_world.py`). Then, in-process with `--color always`, it runs `status`, `start` for the running broker, `who '#build'`, `tail '#build'`, `remote status` and `report` against that broker. A paired throwaway home shows the real `start` dialer status path with a stand-in running pid, and `join --help` shows the new pairing command without using a code. `install all --dry-run` / `uninstall all --dry-run` run against a throwaway user home. The PATH holds stub `claude`, `codex` and `devin` commands and no Cursor CLI, so Cursor shows as skipped. The install diff shows `/opt/switchboard/bin/python3` as the interpreter the hooks run, not this checkout's venv. `/hold` and `/release` fire once so the report has a rule to colour.
 - **Rendered, not captured from a terminal.** Each output's colour codes become styled HTML: html-escaped text, the 8 basic colours plus bold and dim. Any other escape code stops the run. The HTML sits in a window titled with the command and is shot with Playwright's Chromium at DPR 2. Every command is shot in dark; `tail` and `install` also in light; and `install` once more with `--color never` (`install-plain-dark.png`), for a before/after.
+
+## Recordings of a change working (`ui_record.py`)
+
+`ui_record.py` records a change to the web UI in use, for a pull request's Verification ([CLAUDE.md](../../CLAUDE.md), and the [`record-verification`](../../.claude/skills/record-verification/SKILL.md) skill for the whole procedure). It is run by hand, and what it writes is never committed, to any branch: a recording reaches a pull request only as a GitHub attachment, which lives outside the repository.
+
+```bash
+uv run --group record python docs/media/ui_record.py --list
+uv run --group record python docs/media/ui_record.py rename-room --out /tmp/recordings
+uv run --group record python docs/media/ui_record.py path/to/my_change.py --out /tmp/recordings --dark --phone
+```
+
+- **Its own dependency group.** `record` adds `imageio-ffmpeg` (which carries an ffmpeg binary) and `pillow`. The regular setup (`uv sync`) doesn't install it, and nothing in `src/`, the tests or CI imports it.
+- **The same isolation and seeded broker** as `ui_shots.py` (`tests/ui_world.py`): a throwaway home, alice and the stand-in agents, headless Chromium.
+- **A scenario** is a function `scenario(take, world)`: `take.step("caption")` lines with clicks and typing between them, and Playwright's `expect` for every wait. `rename-room`, in the script, is the worked example. A pull request's own scenario is a `.py` file given by path, pasted into the pull request rather than added to the script.
+- **What it writes:** `<name>.mp4`, the recording; `<name>.gif`, a smaller copy for a chat or an email; and `<name>.steps.png`, the picture at the end of each step, to check that each shows what its caption says.
+- **How:** the browser's own screencast frames, each with the time it was drawn, joined by ffmpeg. The caption sits in a bar above the page, never over it, and not under it, where a video player's controls cover it. Each click gets a ring, since a headless page has no pointer. The sign-in and the way to the room are cut off the front. `tests/unit/test_ui_record.py` checks the timing and the caption wrapping without a browser.
 
 ## The tab icon (`make_icons.py`)
 

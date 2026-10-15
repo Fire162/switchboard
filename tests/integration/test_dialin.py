@@ -130,9 +130,9 @@ def test_removing_a_person_removes_the_machines_they_paired_or_approved(d: DialI
     sent: list[str] = []  # room-less notices go to the web UI only: catch them at the hub
     real = d.b.state.hub.notice
     d.b.state.hub.notice = lambda room, level, text: (sent.append(text), real(room, level, text))[1]
-    one_time = d.api("POST", "/api/people", {"name": "bob"}).json()["password"]
+    one_time = d.api("POST", "/api/people", {"name": "bob", "email": "bob@example.com"}).json()["password"]
     bob = Browser(d.b, d.host, d.origin)
-    r = bob.post("/api/signin/password", {"name": "bob", "password": one_time})
+    r = bob.post("/api/signin/password", {"name": "bob@example.com", "password": one_time})
     assert r.status_code == 200, r.text
     assert bob.post("/api/me/password", {"password": "bob's own secret 1"}).status_code == 200
     bob_id = d.b.state.store.person_named("bob").id
@@ -436,6 +436,23 @@ def test_the_desktop_takes_no_machines(broker: Any, web: httpx.Client) -> None:
 
 
 # ------------------------------------------------------------ remote join
+def test_join_short_name_pairs_and_keeps_the_same_trust_checks(d: DialIn) -> None:
+    """The onboarding spelling reaches real pairing, then refuses the same spent code."""
+    code = d.code()
+    first = d.cli("join", d.origin, code, "--test-mode", "--no-start")
+    assert first.returncode == 0, first.stderr
+    assert "Check the web UI shows the same before you approve it." in first.stdout
+    assert (d.machine / "satellite.toml").exists()
+    other = make_pi_home(satellite=False)
+    try:
+        spent = d.cli("join", d.origin, code, "--test-mode", "--no-start", home=other)
+        assert spent.returncode == 1
+        assert "This code was already used by another machine" in spent.stdout
+        assert not (other / "satellite.toml").exists()
+    finally:
+        shutil.rmtree(other, ignore_errors=True)
+
+
 def test_join_refuses_a_home_with_a_broker_and_a_used_code(d: DialIn, tmp_path: Path) -> None:
     code = d.code()
     desk = make_pi_home(satellite=False)

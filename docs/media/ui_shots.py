@@ -50,6 +50,8 @@ proof-before-{light,dark,phone-light} and proof-after-{light,dark,phone-light} (
 review finding before its fix, then a fix's proof waiting for confirmation, #251),
 handoff-dialog-{light,dark,phone-light} and handoff-after-{light,dark,phone-light} (the one
 review summary and Posted by choice, then the selected agent's handoff, #252),
+outdated-before-{light,dark,phone-light} and outdated-after-{light,dark,phone-light}
+(a board's unresolved findings before and after an agent moves its head, #291),
 confirm-light, signin-light, setup-person-light and
 signin-phone-dark, and from a second one at
 ``http://localhost:<port>``, with test machines that dial in (``tests/fakes/fake_machine.py``:
@@ -427,6 +429,45 @@ def shoot_offline(browser: Any, out: Path, world: Any) -> None:
             ctx.close()
 
 
+def shoot_claims(browser: Any, out: Path, world: Any) -> None:
+    """Outside-work claims (#293): Members before and after one agent claims a build."""
+    from playwright.sync_api import expect
+
+    room = "#ops-claims"
+    world.create_room(room)
+    world.add_agents(room, ("claude-1", "codex-1"))
+    base = {"timezone_id": "UTC", "locale": "en-US"}
+    for stage in ("before", "after"):
+        if stage == "after":
+            result = world.agent_call(room, "claude-1", "claim", key="build", ttl=3600)
+            assert result["ok"], result
+        for theme, ctx_args in (
+            ("light", {**DESKTOP, "color_scheme": "light"}),
+            ("dark", {**DESKTOP, "color_scheme": "dark"}),
+            ("phone-light", {**PHONE, "color_scheme": "light"}),
+        ):
+            ctx = browser.new_context(**base, **ctx_args)
+            ctx.set_default_timeout(WAIT_MS)
+            try:
+                page = ctx.new_page()
+                sign_in(page, world.broker)
+                tab = page.locator(f'#tabs .room[data-room="{room}"]')
+                if not tab.is_visible():
+                    page.click("#rooms-toggle")
+                tab.click()
+                if theme == "phone-light":
+                    page.click("#buddy-toggle")
+                mark = page.locator('#buddy-list .member[data-name="claude-1"] .m-claim-entry')
+                if stage == "after":
+                    expect(mark).to_contain_text("Claim: build · Expires")
+                else:
+                    expect(mark).to_have_count(0)
+                settle(page)
+                shot(page, out, f"claims-{stage}-{theme}.png")
+            finally:
+                ctx.close()
+
+
 def shoot_board(browser: Any, out: Path, world: Any) -> None:
     """The review board (#80): a room of its own, after every #build shot, so none of those
     shows its board button. Its question open on the right, in light, dark and on a phone."""
@@ -455,6 +496,55 @@ def shoot_board(browser: Any, out: Path, world: Any) -> None:
             expect(page.locator("#board .board-detail")).to_be_visible()
             settle(page)
             shot(page, out, name)
+        finally:
+            ctx.close()
+
+
+def shoot_outdated_board(browser: Any, out: Path, world: Any) -> None:
+    """#291: the same open finding before and after an agent moves the board's head."""
+    from playwright.sync_api import expect
+
+    base = {"timezone_id": "UTC", "locale": "en-US"}
+    for slug, size, scheme in (
+        ("light", DESKTOP, "light"),
+        ("dark", DESKTOP, "dark"),
+        ("phone-light", PHONE, "light"),
+    ):
+        room = "#outdated-" + slug
+        world.create_room(room)
+        world.add_agents(room, ("claude-1", "codex-1"))
+        world.seed_review(room)
+        ctx = browser.new_context(**base, **size, color_scheme=scheme)
+        ctx.set_default_timeout(WAIT_MS)
+        try:
+            page = ctx.new_page()
+            sign_in(page, world.broker)
+            tab = page.locator('#tabs .room[data-room="' + room + '"]')
+            if not tab.is_visible():
+                page.click("#rooms-toggle")
+            tab.click()
+            page.click("#board-toggle")
+            page.click('#board .board-card[data-item="F3"]')
+            detail = page.locator("#board .board-detail")
+            expect(detail).to_be_visible()
+            if size is PHONE:
+                detail.scroll_into_view_if_needed()
+            settle(page)
+            shot(page, out, "outdated-before-" + slug + ".png")
+            moved = world.agent_call(
+                room,
+                "codex-1",
+                "review",
+                action="open",
+                url="https://example.com/shop/pull/7",
+                head="7b9c2a4d6e8f",
+            )
+            assert moved["ok"], moved
+            expect(detail.locator(".board-outdated")).to_have_text("Outdated at 7b9c2a4")
+            if size is PHONE:
+                detail.scroll_into_view_if_needed()
+            settle(page)
+            shot(page, out, "outdated-after-" + slug + ".png")
         finally:
             ctx.close()
 
@@ -1380,6 +1470,8 @@ def run(args: argparse.Namespace, pw: Any) -> None:
         try:
             shoot(browser, out, world)
             shoot_board(browser, out, world)
+            shoot_outdated_board(browser, out, world)
+            shoot_claims(browser, out, world)
             shoot_proof_board(browser, out, world)
             shoot_handoff_board(browser, out, world)
             shoot_mentions(browser, out, world)
