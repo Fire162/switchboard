@@ -82,7 +82,10 @@ def install_argv(inst: Installer, version: str | None, tool: str) -> list[str]:
         )
     spec = f"{DIST}=={version}" if version else (f"{DIST}@latest" if inst.kind == "uv" else DIST)
     if inst.kind == "uv":
+        # uv answers from its copy of the index for up to ten minutes, so right after a release it
+        # said "already the newest" (#330): --refresh-package asks again, for this one package
         return [tool, "tool", "install", "--refresh-package", DIST, spec]
+    # no flag for pipx: pip asks the index again on every run (it sends max-age=0 for /simple/ pages)
     return [tool, "install", "--force", spec]
 
 

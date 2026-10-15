@@ -1,3 +1,3 @@
 ### Fixed
 
-- **`switchboard update` passes `--refresh-package switchboard-chat` to uv.** Previously, uv could use its cached PyPI index for up to 10 minutes and report that switchboard was already the newest version right after a release was published.
+- **`switchboard update` finds a release published minutes ago.** Right after a release it could say "already the newest" and exit 0, because uv answered from its cached copy of the package index (up to ten minutes old). It now asks uv to refresh the index for this one package.
